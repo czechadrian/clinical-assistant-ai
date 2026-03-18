@@ -14,3 +14,9 @@ __pycache__
 
 # misc
 .DS_Store
+
+.cursor
+.env
+.env.example
+.env.local
+web/.env.local
