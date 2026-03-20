@@ -3,54 +3,56 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
-import { TestApiButton } from "@/components/TestApiButton";
+import { ConversationList, type Conversation } from "@/components/ConversationList";
+import { MessagePanel } from "@/components/MessagePanel";
 
-type AppState =
+type PageState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; email: string | null };
 
 export default function AppPage() {
   const router = useRouter();
-  const [state, setState] = useState<AppState>({ status: "loading" });
+  const [pageState, setPageState] = useState<PageState>({ status: "loading" });
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+
+  // Fetch conversations ordered newest-first for the sidebar
+  async function fetchConversations() {
+    const { data } = await supabase
+      .from("conversations")
+      .select("id, created_at")
+      .order("created_at", { ascending: false });
+    setConversations(data ?? []);
+  }
 
   useEffect(() => {
     let cancelled = false;
 
     async function init() {
-      // getUser() validates the token server-side — safe to use as the
-      // source of truth for user.id before writing to the database.
+      // getUser() validates server-side — safe source of user_id for DB writes
       const {
         data: { user },
         error,
       } = await supabase.auth.getUser();
 
       if (cancelled) return;
+      if (error || !user) { router.replace("/login"); return; }
 
-      if (error || !user) {
-        router.replace("/login");
-        return;
-      }
-
+      // Ensure the profile row exists (idempotent)
       const { error: upsertError } = await supabase
         .from("profiles")
         .upsert({ id: user.id, email: user.email ?? null }, { onConflict: "id" });
 
       if (cancelled) return;
+      if (upsertError) { setPageState({ status: "error", message: upsertError.message }); return; }
 
-      if (upsertError) {
-        setState({ status: "error", message: upsertError.message });
-        return;
-      }
-
-      setState({ status: "ready", email: user.email ?? null });
+      setPageState({ status: "ready", email: user.email ?? null });
+      await fetchConversations();
     }
 
     void init();
-
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [router]);
 
   async function handleLogout() {
@@ -58,22 +60,28 @@ export default function AppPage() {
     router.replace("/login");
   }
 
-  if (state.status === "loading") {
+  // Called by MessagePanel when a message creates a new conversation
+  async function handleConversationCreated(id: string) {
+    await fetchConversations();
+    setSelectedId(id);
+  }
+
+  if (pageState.status === "loading") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
         <div className="rounded-full border border-zinc-200 bg-white px-4 py-2 text-sm text-zinc-600 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
-          Loading your profile…
+          Loading…
         </div>
       </div>
     );
   }
 
-  if (state.status === "error") {
+  if (pageState.status === "error") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
         <div className="w-full max-w-md rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-100">
           <p className="font-semibold">Something went wrong</p>
-          <p className="mt-2">{state.message}</p>
+          <p className="mt-2">{pageState.message}</p>
           <button
             onClick={handleLogout}
             className="mt-4 rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-900 transition hover:bg-red-100 dark:border-red-700 dark:text-red-100 dark:hover:bg-red-900/40"
@@ -86,40 +94,19 @@ export default function AppPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="w-full max-w-2xl rounded-2xl bg-white p-10 shadow-sm dark:bg-zinc-950">
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
-            App
-          </h1>
-          <button
-            onClick={handleLogout}
-            className="rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-700 transition hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-800"
-          >
-            Log out
-          </button>
-        </div>
-
-        <p className="mb-2 text-sm text-zinc-600 dark:text-zinc-400">
-          You are logged in via Supabase.
-        </p>
-        {state.email ? (
-          <p className="mb-4 text-sm text-zinc-800 dark:text-zinc-200">
-            Signed in as <span className="font-medium">{state.email}</span>
-          </p>
-        ) : (
-          <p className="mb-4 text-sm text-zinc-800 dark:text-zinc-200">
-            Signed in user has no email.
-          </p>
-        )}
-
-        <section className="mt-6 border-t border-zinc-200 pt-4 dark:border-zinc-800">
-          <h2 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-50">
-            Test backend API
-          </h2>
-          <TestApiButton />
-        </section>
-      </main>
+    <div className="flex h-screen overflow-hidden bg-zinc-50 font-sans dark:bg-black">
+      <ConversationList
+        conversations={conversations}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+        onNew={() => setSelectedId(null)}
+        email={pageState.email}
+        onLogout={handleLogout}
+      />
+      <MessagePanel
+        conversationId={selectedId}
+        onConversationCreated={handleConversationCreated}
+      />
     </div>
   );
 }
