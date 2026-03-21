@@ -1,6 +1,11 @@
 import { supabase } from "@/lib/supabaseClient";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+// NEXT_PUBLIC_API_BASE_URL is the canonical name; NEXT_PUBLIC_BACKEND_URL kept
+// for backwards-compatibility with existing .env.local files.
+const BACKEND_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ??
+  process.env.NEXT_PUBLIC_BACKEND_URL ??
+  "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -115,23 +120,45 @@ export type MessageOut = {
   id: string;
   conversation_id: string;
   role: string;
-  content: string;
+  content: string; // JSON-encoded AssistantPayload for assistant messages
 };
 
+export type Source = {
+  id: string;
+  title: string;
+  section: string;
+};
+
+export type AssistantPayload = {
+  questions_to_ask: string[];
+  red_flags: string[];
+  possible_next_steps: string[];
+  patient_facing_summary: string;
+  sources: Source[];
+  flag: "safe" | "uncertain" | "refuse";
+  disclaimer: string;
+};
+
+export type ChatMode = "triage" | "summary" | "patient_message";
+
 export type ChatApiResponse = {
+  request_id: string;
   conversation_id: string;
   user_message: MessageOut;
   assistant_message: MessageOut;
+  assistant_payload: AssistantPayload; // parsed — no client-side JSON.parse needed
 };
 
 export async function postChat(
-  message: string,
+  inputText: string,
   conversationId?: string,
+  mode: ChatMode = "triage",
 ): Promise<ChatApiResponse> {
   return apiFetch<ChatApiResponse>("/chat", {
     method: "POST",
     body: JSON.stringify({
-      message,
+      mode,
+      input_text: inputText,
       conversation_id: conversationId ?? null,
     }),
   });

@@ -1,13 +1,19 @@
+import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from guardrails import detect_pii
+from policy import SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
 
 load_dotenv()
@@ -125,21 +131,138 @@ async def _db_insert(table: str, payload: dict) -> dict:
 
 
 class ChatRequest(BaseModel):
+    mode: Literal["triage", "summary", "patient_message"]
+    input_text: str = Field(..., min_length=1, max_length=2000)
     conversation_id: str | None = None  # omit to start a new conversation
-    message: str
+
+
+class Source(BaseModel):
+    """A guideline or reference cited in the response."""
+
+    id: str
+    title: str
+    section: str
+
+
+class AssistantPayload(BaseModel):
+    """Structured content returned for every assistant turn.
+
+    questions_to_ask      — clarifying questions when the clinical picture is incomplete.
+    red_flags             — symptoms/signs that require immediate escalation; empty if none.
+    possible_next_steps   — suggested diagnostic or management steps in priority order.
+    patient_facing_summary— plain-language explanation suitable for the patient; no diagnosis.
+    sources               — guidelines cited; empty list when uncertain about existence.
+    flag                  — "safe": answered normally,
+                            "uncertain": partial answer / needs clarification,
+                            "refuse": outside safe scope, not answered.
+    disclaimer            — mandatory safety reminder (never omit).
+    """
+
+    questions_to_ask: list[str]
+    red_flags: list[str]
+    possible_next_steps: list[str]
+    patient_facing_summary: str
+    sources: list[Source]
+    flag: Literal["safe", "uncertain", "refuse"]
+    disclaimer: str
 
 
 class MessageOut(BaseModel):
     id: str
     conversation_id: str
     role: str
-    content: str
+    content: str  # JSON-encoded AssistantPayload for assistant messages
 
 
 class ChatResponse(BaseModel):
+    request_id: str  # UUID v4 — use for logging and client-side deduplication
     conversation_id: str
     user_message: MessageOut
     assistant_message: MessageOut
+    assistant_payload: AssistantPayload  # parsed payload — avoids client-side JSON.parse
+
+
+# ---------------------------------------------------------------------------
+# Mock payload factory
+#
+# Returns a schema-valid AssistantPayload tailored to each mode.
+# Replace with a real Claude call (using SYSTEM_PROMPT) in the next sprint.
+# ---------------------------------------------------------------------------
+
+_DISCLAIMER = (
+    "Asystent AI nie zastepuje porady lekarskiej ani decyzji klinicznej. "
+    "Zawsze konsultuj sie z wykwalifikowanym specjalista."
+)
+
+
+def _build_mock_payload(mode: str, input_text: str) -> AssistantPayload:
+    if mode == "triage":
+        return AssistantPayload(
+            questions_to_ask=[
+                "Jak dlugo trwaja objawy?",
+                "Czy wystepuja objawy alarmowe (bol w klatce piersiowej, dusznosc, utrata przytomnosci)?",
+                "Jakie leki przyjmuje pacjent na stale?",
+            ],
+            red_flags=[
+                "Bol w klatce piersiowej promieniujacy do lewego ramienia lub szczeki — wykluczyc OZW.",
+                "Nagla dusznosc spoczynkowa — pilna ocena ukladu oddechowego i krazenia.",
+            ],
+            possible_next_steps=[
+                "Zebranie pelnego wywiadu lekarskiego i badanie fizykalne.",
+                "EKG 12-odpr. jesli podejrzenie OZW.",
+                "W przypadku objawow zagrazajacych zyciu — natychmiastowe skierowanie na SOR.",
+            ],
+            patient_facing_summary=(
+                "Lekarz zbiera informacje o Twoich objawach, "
+                "aby ocenic, jaka pomoc jest Ci potrzebna."
+            ),
+            sources=[],
+            flag="uncertain",
+            disclaimer=_DISCLAIMER,
+        )
+
+    if mode == "summary":
+        return AssistantPayload(
+            questions_to_ask=[],
+            red_flags=[],
+            possible_next_steps=[
+                "Przekazac podsumowanie kliniczne lekarzowi prowadzacemu.",
+                "Zaktualizowac dokumentacje medyczna pacjenta.",
+            ],
+            patient_facing_summary=(
+                "Ponizej przedstawiono podsumowanie wizyty. "
+                "W razie pytan prosimy o kontakt z lekarzem."
+            ),
+            sources=[
+                Source(
+                    id="mock-summary-001",
+                    title="Standardy dokumentacji medycznej PTL",
+                    section="Rozdzial 3 — Podsumowanie wizyty ambulatoryjnej",
+                )
+            ],
+            flag="safe",
+            disclaimer=_DISCLAIMER,
+        )
+
+    # mode == "patient_message"
+    return AssistantPayload(
+        questions_to_ask=[
+            "Czy rozumiesz zalecenia lekarza i nie masz dodatkowych pytan?",
+        ],
+        red_flags=[],
+        possible_next_steps=[
+            "Przyjmuj leki zgodnie z zaleceniami — nie przerywaj terapii samodzielnie.",
+            "Jesli objawy sie nasilaja lub pojawia sie nowe — skontaktuj sie z lekarzem.",
+            "W nagłym przypadku zadzwon pod numer alarmowy 112.",
+        ],
+        patient_facing_summary=(
+            "Twoj lekarz przygotowal dla Ciebie te informacje. "
+            "Prosimy o zapoznanie sie z nimi i przestrzeganie zalecen."
+        ),
+        sources=[],
+        flag="safe",
+        disclaimer="Te informacje maja charakter pomocniczy i nie zastepuja indywidualnej porady lekarskiej.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -167,54 +290,111 @@ async def whoami(user: dict = Depends(get_supabase_user)):  # noqa: B008
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):  # noqa: B008
+    request_id = str(uuid.uuid4())
+    start = time.perf_counter()
     user_id: str = user["id"]  # authoritative — comes from Supabase, not the client
+    input_length = len(body.input_text)
+    status_code = 200
 
-    # 1. Resolve conversation ------------------------------------------------
-    if body.conversation_id is None:
-        conversation = await _db_insert("conversations", {"user_id": user_id})
-        conversation_id: str = conversation["id"]
-    else:
-        # Verify the conversation exists AND belongs to this user.
-        # Filtering on both id and user_id means a wrong user gets 403,
-        # not a data leak.
-        response = await _db_client.get(
-            "/conversations",
-            params={"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
-        )
-        rows = response.json()
-        if not rows:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
+    # Logged on arrival — never includes raw content.
+    logger.info(
+        "chat_request",
+        extra={
+            "request_id": request_id,
+            "user_id": user_id,
+            "mode": body.mode,
+            "input_length": input_length,
+        },
+    )
+
+    try:
+        # 0. PII guardrail — fail fast before any DB write -------------------
+        pii_label = detect_pii(body.input_text)
+        if pii_label:
+            logger.warning(
+                "pii_rejected",
+                extra={"request_id": request_id, "pii_type": pii_label},
             )
-        conversation_id = rows[0]["id"]
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Potentially identifying patient data detected ({pii_label}). "
+                "Please remove personal identifiers before submitting.",
+            )
 
-    # 2. Insert user message -------------------------------------------------
-    user_message = await _db_insert(
-        "messages",
-        {
-            "conversation_id": conversation_id,
-            "role": "user",
-            "content": body.message,
-            "user_id": user_id,
-        },
-    )
+        # 1. Resolve conversation --------------------------------------------
+        if body.conversation_id is None:
+            conversation = await _db_insert("conversations", {"user_id": user_id})
+            conversation_id: str = conversation["id"]
+        else:
+            response = await _db_client.get(
+                "/conversations",
+                params={
+                    "id": f"eq.{body.conversation_id}",
+                    "user_id": f"eq.{user_id}",
+                    "select": "id",
+                },
+            )
+            rows = response.json()
+            if not rows:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
+                )
+            conversation_id = rows[0]["id"]
 
-    # 3. Generate mock reply -------------------------------------------------
-    reply_content = f"[mock] You said: {body.message}"
+        # 2. Insert user message ---------------------------------------------
+        user_message = await _db_insert(
+            "messages",
+            {
+                "conversation_id": conversation_id,
+                "role": "user",
+                "content": body.input_text,
+                "user_id": user_id,
+            },
+        )
 
-    # 4. Insert assistant message --------------------------------------------
-    assistant_message = await _db_insert(
-        "messages",
-        {
-            "conversation_id": conversation_id,
-            "role": "assistant",
-            "content": reply_content,
-            "user_id": user_id,
-        },
-    )
+        # 3. Build structured mock reply -------------------------------------
+        # TODO: replace with real Claude API call using SYSTEM_PROMPT once the
+        #       Anthropic SDK is wired in. The schema and mock shapes are final.
+        payload = _build_mock_payload(body.mode, body.input_text)
 
-    return ChatResponse(
-        conversation_id=conversation_id,
-        user_message=MessageOut(**user_message),
-        assistant_message=MessageOut(**assistant_message),
-    )
+        # 4. Insert assistant message ----------------------------------------
+        assistant_message = await _db_insert(
+            "messages",
+            {
+                "conversation_id": conversation_id,
+                "role": "assistant",
+                "content": json.dumps(payload.model_dump(), ensure_ascii=False),
+                "user_id": user_id,
+            },
+        )
+
+        return ChatResponse(
+            request_id=request_id,
+            conversation_id=conversation_id,
+            user_message=MessageOut(**user_message),
+            assistant_message=MessageOut(**assistant_message),
+            assistant_payload=payload,
+        )
+
+    except HTTPException as exc:
+        status_code = exc.status_code
+        raise  # re-raise so FastAPI still returns the correct HTTP response
+
+    except Exception:
+        status_code = 500
+        raise
+
+    finally:
+        # Fires on every exit path: success, HTTPException, or unhandled error.
+        # Raw input and output content are never included.
+        logger.info(
+            "chat_complete",
+            extra={
+                "request_id": request_id,
+                "user_id": user_id,
+                "mode": body.mode,
+                "input_length": input_length,
+                "status_code": status_code,
+                "latency_ms": round((time.perf_counter() - start) * 1000),
+            },
+        )

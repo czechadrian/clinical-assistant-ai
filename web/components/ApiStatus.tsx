@@ -2,10 +2,12 @@
 
 import { useEffect, useState } from "react";
 
-// Reads the same env var used by lib/api.ts so there is one source of truth
-// for the backend URL. NEXT_PUBLIC_* is inlined at build time — safe to use
-// in the browser because it's just a URL, not a secret.
-const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+// Reads the same env vars used by lib/api.ts — one source of truth for the URL.
+// NEXT_PUBLIC_* is inlined at build time; safe in the browser (just a URL, not a secret).
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ??
+  process.env.NEXT_PUBLIC_BACKEND_URL ??
+  "http://localhost:8000";
 
 type Status = "loading" | "ok" | "error";
 

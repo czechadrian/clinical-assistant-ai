@@ -60,9 +60,8 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "msg": record.message,
+            **extra,  # request_id, latency_ms, etc. at the top level for easy querying
         }
-        if extra:
-            payload["extra"] = extra
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload)
