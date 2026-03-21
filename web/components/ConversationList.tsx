@@ -1,5 +1,7 @@
 "use client";
 
+import { ApiStatus } from "@/components/ApiStatus";
+
 export type Conversation = {
   id: string;
   created_at: string;
@@ -60,7 +62,8 @@ export function ConversationList({
 
       {/* Footer */}
       <div className="border-t border-zinc-200 p-3 dark:border-zinc-800">
-        <p className="mb-2 truncate text-xs text-zinc-400">{email ?? ""}</p>
+        <ApiStatus />
+        <p className="mb-2 mt-1 truncate text-xs text-zinc-400">{email ?? ""}</p>
         <button
           onClick={onLogout}
           className="w-full rounded-lg border border-zinc-200 py-1.5 text-xs font-medium text-zinc-600 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"

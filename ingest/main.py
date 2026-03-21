@@ -1,4 +1,4 @@
-import os
+import logging
 from contextlib import asynccontextmanager
 
 import httpx
@@ -8,11 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+from settings import Settings, configure_logging
+
 load_dotenv()
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+settings = Settings.from_env()
+configure_logging(settings.app_env)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # HTTP clients
@@ -41,27 +44,34 @@ _db_client: httpx.AsyncClient
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _auth_client, _db_client
-    _auth_client = httpx.AsyncClient(base_url=SUPABASE_URL)
+    _auth_client = httpx.AsyncClient(base_url=settings.supabase_url)
     _db_client = httpx.AsyncClient(
-        base_url=f"{SUPABASE_URL}/rest/v1",
+        base_url=f"{settings.supabase_url}/rest/v1",
         headers={
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": settings.supabase_service_role_key,
+            "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "Content-Type": "application/json",
         },
+    )
+    logger.info(
+        "startup",
+        extra={"app_env": settings.app_env, "git_commit": settings.git_commit},
     )
     yield
     await _auth_client.aclose()
     await _db_client.aclose()
+    logger.info("shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"],
+    allow_origins=settings.allowed_origins,
+    allow_origin_regex=settings.cors_origin_regex,
+    allow_methods=["GET", "POST"],  # only what this API actually exposes
     allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=False,  # Bearer tokens, not cookies
 )
 
 bearer_scheme = HTTPBearer()
@@ -73,7 +83,7 @@ bearer_scheme = HTTPBearer()
 
 
 async def get_supabase_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),  # noqa: B008
 ) -> dict:
     """Validate the Bearer token against Supabase and return the user object.
 
@@ -84,7 +94,7 @@ async def get_supabase_user(
         "/auth/v1/user",
         headers={
             "Authorization": f"Bearer {credentials.credentials}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "apikey": settings.supabase_service_role_key,
         },
     )
     if response.status_code != 200:
@@ -137,13 +147,26 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/version")
+async def version():
+    return {
+        "git_commit": settings.git_commit,
+        "app_env": settings.app_env,
+    }
+
+
 @app.get("/whoami")
-async def whoami(user: dict = Depends(get_supabase_user)):
+async def whoami(user: dict = Depends(get_supabase_user)):  # noqa: B008
     return {"user_id": user["id"], "email": user.get("email")}
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):
+async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):  # noqa: B008
     user_id: str = user["id"]  # authoritative — comes from Supabase, not the client
 
     # 1. Resolve conversation ------------------------------------------------
@@ -160,13 +183,20 @@ async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):
         )
         rows = response.json()
         if not rows:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Conversation not found or access denied")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
+            )
         conversation_id = rows[0]["id"]
 
     # 2. Insert user message -------------------------------------------------
     user_message = await _db_insert(
         "messages",
-        {"conversation_id": conversation_id, "role": "user", "content": body.message, "user_id": user_id},
+        {
+            "conversation_id": conversation_id,
+            "role": "user",
+            "content": body.message,
+            "user_id": user_id,
+        },
     )
 
     # 3. Generate mock reply -------------------------------------------------
@@ -175,7 +205,12 @@ async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):
     # 4. Insert assistant message --------------------------------------------
     assistant_message = await _db_insert(
         "messages",
-        {"conversation_id": conversation_id, "role": "assistant", "content": reply_content, "user_id": user_id},
+        {
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": reply_content,
+            "user_id": user_id,
+        },
     )
 
     return ChatResponse(
