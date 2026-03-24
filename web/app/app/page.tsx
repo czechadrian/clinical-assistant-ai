@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
+import { listConversations } from "@/lib/api";
 import { ConversationList, type Conversation } from "@/components/ConversationList";
 import { MessagePanel } from "@/components/MessagePanel";
 
@@ -17,13 +18,10 @@ export default function AppPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  // Fetch conversations ordered newest-first for the sidebar
+  // Fetch conversations via the backend so RLS is enforced through the API layer.
   async function fetchConversations() {
-    const { data } = await supabase
-      .from("conversations")
-      .select("id, created_at")
-      .order("created_at", { ascending: false });
-    setConversations(data ?? []);
+    const data = await listConversations().catch(() => []);
+    setConversations(data as Conversation[]);
   }
 
   useEffect(() => {

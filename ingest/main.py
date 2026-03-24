@@ -1,9 +1,9 @@
-import json
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -54,8 +54,10 @@ async def lifespan(_: FastAPI):
     _db_client = httpx.AsyncClient(
         base_url=f"{settings.supabase_url}/rest/v1",
         headers={
+            # apikey identifies the project at the API-gateway level.
+            # Authorization is injected per-request with the user's JWT
+            # so PostgREST evaluates RLS as that specific user.
             "apikey": settings.supabase_service_role_key,
-            "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "Content-Type": "application/json",
         },
     )
@@ -84,22 +86,22 @@ bearer_scheme = HTTPBearer()
 
 
 # ---------------------------------------------------------------------------
-# Auth dependency
+# Auth
 # ---------------------------------------------------------------------------
 
 
-async def get_supabase_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),  # noqa: B008
-) -> dict:
-    """Validate the Bearer token against Supabase and return the user object.
+@dataclass
+class Auth:
+    user_id: str
+    jwt: str  # raw Bearer token — forwarded to PostgREST so RLS runs as this user
 
-    user["id"] from this response is the only safe source of user_id.
-    Never read user_id from the request body.
-    """
+
+async def _validate_token(token: str) -> dict:
+    """Call Supabase Auth to verify the token. Returns the user object."""
     response = await _auth_client.get(
         "/auth/v1/user",
         headers={
-            "Authorization": f"Bearer {credentials.credentials}",
+            "Authorization": f"Bearer {token}",
             "apikey": settings.supabase_service_role_key,
         },
     )
@@ -108,21 +110,52 @@ async def get_supabase_user(
     return response.json()
 
 
+async def get_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),  # noqa: B008
+) -> Auth:
+    """FastAPI dependency — validates JWT and returns Auth(user_id, jwt)."""
+    user = await _validate_token(credentials.credentials)
+    return Auth(user_id=user["id"], jwt=credentials.credentials)
+
+
+async def get_supabase_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),  # noqa: B008
+) -> dict:
+    """Legacy dependency kept for /whoami. Prefer get_auth for new endpoints."""
+    return await _validate_token(credentials.credentials)
+
+
 # ---------------------------------------------------------------------------
-# Supabase REST helper
+# Supabase REST helpers
+#
+# Both helpers accept the caller's JWT and inject it as Authorization.
+# PostgREST evaluates RLS policies against auth.uid() from that JWT, so
+# each user can only read/write their own rows — no extra filtering needed.
 # ---------------------------------------------------------------------------
 
 
-async def _db_insert(table: str, payload: dict) -> dict:
-    """Insert one row and return it. Raises 500 on failure."""
+def _rls_headers(jwt: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {jwt}"}
+
+
+async def _db_insert(table: str, row: dict, jwt: str) -> dict:
+    """Insert one row and return it. RLS applies via the caller's JWT."""
     response = await _db_client.post(
         f"/{table}",
-        json=payload,
-        headers={"Prefer": "return=representation"},
+        json=row,
+        headers={**_rls_headers(jwt), "Prefer": "return=representation"},
     )
     if response.status_code not in (200, 201):
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"DB insert failed: {table}")
     return response.json()[0]
+
+
+async def _db_select(path: str, params: dict, jwt: str) -> list[dict]:
+    """Run a GET query against PostgREST. RLS applies via the caller's JWT."""
+    response = await _db_client.get(path, params=params, headers=_rls_headers(jwt))
+    if not response.is_success:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"DB query failed: {path}")
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -130,10 +163,21 @@ async def _db_insert(table: str, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class CreateConversationRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
+class ConversationOut(BaseModel):
+    id: str
+    title: str | None
+    created_at: str
+    updated_at: str
+
+
 class ChatRequest(BaseModel):
     mode: Literal["triage", "summary", "patient_message"]
     input_text: str = Field(..., min_length=1, max_length=2000)
-    conversation_id: str | None = None  # omit to start a new conversation
+    conversation_id: str  # required — create via POST /conversations first
 
 
 class Source(BaseModel):
@@ -171,15 +215,12 @@ class MessageOut(BaseModel):
     id: str
     conversation_id: str
     role: str
-    content: str  # JSON-encoded AssistantPayload for assistant messages
+    content: dict[str, Any]  # JSONB: {"text": "..."} for user, AssistantPayload for assistant
 
 
 class ChatResponse(BaseModel):
     request_id: str  # UUID v4 — use for logging and client-side deduplication
-    conversation_id: str
-    user_message: MessageOut
-    assistant_message: MessageOut
-    assistant_payload: AssistantPayload  # parsed payload — avoids client-side JSON.parse
+    assistant_payload: AssistantPayload
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +329,65 @@ async def whoami(user: dict = Depends(get_supabase_user)):  # noqa: B008
     return {"user_id": user["id"], "email": user.get("email")}
 
 
+@app.post("/conversations", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    body: CreateConversationRequest,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    row = await _db_insert(
+        "conversations",
+        {"user_id": auth.user_id, "title": body.title},
+        auth.jwt,
+    )
+    return ConversationOut(**row)
+
+
+@app.get("/conversations", response_model=list[ConversationOut])
+async def list_conversations(auth: Auth = Depends(get_auth)):  # noqa: B008
+    rows = await _db_select(
+        "/conversations",
+        {
+            "user_id": f"eq.{auth.user_id}",
+            "order": "updated_at.desc",
+            "select": "id,title,created_at,updated_at",
+        },
+        auth.jwt,
+    )
+    return [ConversationOut(**r) for r in rows]
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=list[MessageOut])
+async def get_messages(
+    conversation_id: str,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    # RLS will silently return [] if the conversation belongs to another user,
+    # which we surface as 404 rather than leaking that the conversation exists.
+    conv_rows = await _db_select(
+        "/conversations",
+        {"id": f"eq.{conversation_id}", "user_id": f"eq.{auth.user_id}", "select": "id"},
+        auth.jwt,
+    )
+    if not conv_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+    rows = await _db_select(
+        "/messages",
+        {
+            "conversation_id": f"eq.{conversation_id}",
+            "order": "created_at.asc",
+            "select": "id,conversation_id,role,content",
+        },
+        auth.jwt,
+    )
+    return [MessageOut(**r) for r in rows]
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):  # noqa: B008
+async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
-    user_id: str = user["id"]  # authoritative — comes from Supabase, not the client
+    user_id = auth.user_id
     input_length = len(body.input_text)
     status_code = 200
 
@@ -321,35 +416,26 @@ async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):  # n
                 "Please remove personal identifiers before submitting.",
             )
 
-        # 1. Resolve conversation --------------------------------------------
-        if body.conversation_id is None:
-            conversation = await _db_insert("conversations", {"user_id": user_id})
-            conversation_id: str = conversation["id"]
-        else:
-            response = await _db_client.get(
-                "/conversations",
-                params={
-                    "id": f"eq.{body.conversation_id}",
-                    "user_id": f"eq.{user_id}",
-                    "select": "id",
-                },
-            )
-            rows = response.json()
-            if not rows:
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
-                )
-            conversation_id = rows[0]["id"]
+        # 1. Verify the conversation exists and belongs to this user ---------
+        # RLS enforces ownership; the explicit user_id filter is defence-in-depth.
+        conv_rows = await _db_select(
+            "/conversations",
+            {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
+            auth.jwt,
+        )
+        if not conv_rows:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Conversation not found or access denied")
 
         # 2. Insert user message ---------------------------------------------
-        user_message = await _db_insert(
+        await _db_insert(
             "messages",
             {
-                "conversation_id": conversation_id,
+                "conversation_id": body.conversation_id,
                 "role": "user",
-                "content": body.input_text,
+                "content": {"text": body.input_text, "mode": body.mode},
                 "user_id": user_id,
             },
+            auth.jwt,
         )
 
         # 3. Build structured mock reply -------------------------------------
@@ -358,23 +444,18 @@ async def chat(body: ChatRequest, user: dict = Depends(get_supabase_user)):  # n
         payload = _build_mock_payload(body.mode, body.input_text)
 
         # 4. Insert assistant message ----------------------------------------
-        assistant_message = await _db_insert(
+        await _db_insert(
             "messages",
             {
-                "conversation_id": conversation_id,
+                "conversation_id": body.conversation_id,
                 "role": "assistant",
-                "content": json.dumps(payload.model_dump(), ensure_ascii=False),
+                "content": payload.model_dump(),
                 "user_id": user_id,
             },
+            auth.jwt,
         )
 
-        return ChatResponse(
-            request_id=request_id,
-            conversation_id=conversation_id,
-            user_message=MessageOut(**user_message),
-            assistant_message=MessageOut(**assistant_message),
-            assistant_payload=payload,
-        )
+        return ChatResponse(request_id=request_id, assistant_payload=payload)
 
     except HTTPException as exc:
         status_code = exc.status_code

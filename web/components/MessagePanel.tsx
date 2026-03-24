@@ -1,14 +1,21 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { supabase } from "@/lib/supabaseClient";
-import { postChat, type AssistantPayload, type ChatMode } from "@/lib/api";
+import { createConversation, getMessages, postChat, type AssistantPayload, type ChatMode } from "@/lib/api";
 
 type Message = {
   id: string;
   role: string;
-  content: string; // JSON-encoded AssistantPayload for assistant messages
+  content: unknown; // JSONB from Supabase: {text} for user, AssistantPayload for assistant
 };
+
+// Handles both new JSONB shape {text: "..."} and legacy plain string.
+function getUserText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content && typeof content === "object" && "text" in content)
+    return String((content as { text: unknown }).text);
+  return "";
+}
 
 const FLAG_STYLES: Record<AssistantPayload["flag"], string> = {
   safe: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400",
@@ -22,16 +29,18 @@ const FLAG_LABELS: Record<AssistantPayload["flag"], string> = {
   refuse: "poza zakresem",
 };
 
-function AssistantBubble({ content }: { content: string }) {
+function AssistantBubble({ content }: { content: unknown }) {
   let payload: AssistantPayload | null = null;
-  try {
-    payload = JSON.parse(content) as AssistantPayload;
-  } catch {
-    // Legacy or malformed content — render as plain text
+  if (typeof content === "string") {
+    // Legacy TEXT rows that haven't been migrated yet
+    try { payload = JSON.parse(content) as AssistantPayload; } catch { /* fallback */ }
+  } else if (content && typeof content === "object") {
+    // Normal JSONB path — already a JS object, no parse needed
+    payload = content as AssistantPayload;
   }
 
   if (!payload) {
-    return <span>{content}</span>;
+    return <span>{getUserText(content)}</span>;
   }
 
   return (
@@ -145,6 +154,7 @@ const MODE_LABELS: Record<ChatMode, string> = {
 export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+  const [newTitle, setNewTitle] = useState("");
   const [mode, setMode] = useState<ChatMode>("triage");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,16 +170,13 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
 
     let cancelled = false;
 
-    supabase
-      .from("messages")
-      .select("id, role, content")
-      .eq("conversation_id", conversationId)
-      .order("created_at", { ascending: true })
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) setError(error.message);
-        else setMessages(data ?? []);
-      });
+    getMessages(conversationId).then((data) => {
+      if (cancelled) return;
+      setMessages(data);
+    }).catch((err) => {
+      if (cancelled) return;
+      setError(err instanceof Error ? err.message : "Failed to load messages");
+    });
 
     return () => {
       cancelled = true;
@@ -189,21 +196,40 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
     setError(null);
     setInput("");
 
+    // Optimistic user bubble — shown immediately before any network calls.
+    const optimisticUser: Message = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: { text, mode },
+    };
+    setMessages((prev) => [...prev, optimisticUser]);
+
     try {
-      const result = await postChat(text, conversationId ?? undefined, mode);
-
-      // Append both messages from the API response — no extra DB round-trip.
-      // If this was a new conversation, the parent will also trigger a
-      // conversation-list refresh, which will cause a re-fetch of messages
-      // via the effect above. Content is identical so no visible flash.
-      setMessages((prev) => [...prev, result.user_message, result.assistant_message]);
-
-      if (!conversationId) {
-        onConversationCreated(result.conversation_id);
+      // If there's no conversation yet, create one.
+      // Use the explicit title if the user typed one; otherwise derive from the message.
+      let convId = conversationId;
+      if (!convId) {
+        const title = newTitle.trim() || text.slice(0, 60);
+        const conv = await createConversation(title);
+        convId = conv.id;
+        setNewTitle("");
+        onConversationCreated(convId);
       }
+
+      const result = await postChat(text, convId, mode);
+
+      // Replace the optimistic user bubble + append assistant reply.
+      const optimisticAssistant: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: result.assistant_payload,
+      };
+      setMessages((prev) => [...prev.slice(0, -1), optimisticUser, optimisticAssistant]);
     } catch (err) {
+      // Roll back the optimistic message and restore the draft.
+      setMessages((prev) => prev.filter((m) => m.id !== optimisticUser.id));
       setError(err instanceof Error ? err.message : "Send failed");
-      setInput(text); // restore on error so the user doesn't lose the message
+      setInput(text);
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -215,9 +241,26 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {messages.length === 0 ? (
-          <p className="mt-8 text-center text-sm text-zinc-400">
-            {conversationId ? "No messages yet." : "Send a message to start a conversation."}
-          </p>
+          <div className="flex flex-col items-center gap-4 pt-12">
+            {!conversationId && (
+              <div className="w-full max-w-sm">
+                <label className="mb-1 block text-xs font-medium text-zinc-500 dark:text-zinc-400">
+                  Conversation title <span className="font-normal text-zinc-400">(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                  placeholder="e.g. 67M chest pain triage"
+                  maxLength={200}
+                  className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-900 outline-none transition focus:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-50 dark:focus:border-zinc-500"
+                />
+              </div>
+            )}
+            <p className="text-sm text-zinc-400">
+              {conversationId ? "No messages yet." : "Type a message below to begin."}
+            </p>
+          </div>
         ) : (
           <div className="space-y-3">
             {messages.map((m) => (
@@ -233,7 +276,7 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
                   }`}
                 >
                   {m.role === "user" ? (
-                    m.content
+                    getUserText(m.content)
                   ) : (
                     <AssistantBubble content={m.content} />
                   )}

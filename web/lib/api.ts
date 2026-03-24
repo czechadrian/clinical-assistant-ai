@@ -120,7 +120,14 @@ export type MessageOut = {
   id: string;
   conversation_id: string;
   role: string;
-  content: string; // JSON-encoded AssistantPayload for assistant messages
+  content: Record<string, unknown>; // JSONB: {text, mode} for user, AssistantPayload for assistant
+};
+
+export type ConversationOut = {
+  id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type Source = {
@@ -143,15 +150,27 @@ export type ChatMode = "triage" | "summary" | "patient_message";
 
 export type ChatApiResponse = {
   request_id: string;
-  conversation_id: string;
-  user_message: MessageOut;
-  assistant_message: MessageOut;
-  assistant_payload: AssistantPayload; // parsed — no client-side JSON.parse needed
+  assistant_payload: AssistantPayload;
 };
+
+export async function createConversation(title: string): Promise<ConversationOut> {
+  return apiFetch<ConversationOut>("/conversations", {
+    method: "POST",
+    body: JSON.stringify({ title }),
+  });
+}
+
+export async function listConversations(): Promise<ConversationOut[]> {
+  return apiFetch<ConversationOut[]>("/conversations");
+}
+
+export async function getMessages(conversationId: string): Promise<MessageOut[]> {
+  return apiFetch<MessageOut[]>(`/conversations/${conversationId}/messages`);
+}
 
 export async function postChat(
   inputText: string,
-  conversationId?: string,
+  conversationId: string,
   mode: ChatMode = "triage",
 ): Promise<ChatApiResponse> {
   return apiFetch<ChatApiResponse>("/chat", {
@@ -159,7 +178,7 @@ export async function postChat(
     body: JSON.stringify({
       mode,
       input_text: inputText,
-      conversation_id: conversationId ?? null,
+      conversation_id: conversationId,
     }),
   });
 }

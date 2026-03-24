@@ -4,7 +4,9 @@ import { ApiStatus } from "@/components/ApiStatus";
 
 export type Conversation = {
   id: string;
+  title: string | null;  // null until set after first message
   created_at: string;
+  updated_at: string;
 };
 
 type Props = {
@@ -54,7 +56,7 @@ export function ConversationList({
                   : "text-zinc-500 hover:bg-zinc-50 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-900 dark:hover:text-zinc-50"
               }`}
             >
-              {new Date(c.created_at).toLocaleString()}
+              {c.title ?? new Date(c.created_at).toLocaleString()}
             </button>
           ))
         )}
