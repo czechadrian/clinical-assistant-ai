@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from guardrails import detect_pii
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
@@ -146,7 +146,20 @@ async def _db_insert(table: str, row: dict, jwt: str) -> dict:
         headers={**_rls_headers(jwt), "Prefer": "return=representation"},
     )
     if response.status_code not in (200, 201):
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"DB insert failed: {table}")
+        # Log the raw PostgREST body so the real cause is visible in server logs.
+        # Common codes: 42501=RLS violation, 42P01=table not found, 23505=unique constraint.
+        logger.error(
+            "db_insert_failed",
+            extra={
+                "table": table,
+                "http_status": response.status_code,
+                "postgrest_error": response.text,
+            },
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"DB insert failed: {table} (HTTP {response.status_code}) — check server logs",
+        )
     return response.json()[0]
 
 
@@ -154,7 +167,18 @@ async def _db_select(path: str, params: dict, jwt: str) -> list[dict]:
     """Run a GET query against PostgREST. RLS applies via the caller's JWT."""
     response = await _db_client.get(path, params=params, headers=_rls_headers(jwt))
     if not response.is_success:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"DB query failed: {path}")
+        logger.error(
+            "db_select_failed",
+            extra={
+                "path": path,
+                "http_status": response.status_code,
+                "postgrest_error": response.text,
+            },
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"DB query failed: {path} (HTTP {response.status_code}) — check server logs",
+        )
     return response.json()
 
 
@@ -216,6 +240,15 @@ class MessageOut(BaseModel):
     conversation_id: str
     role: str
     content: dict[str, Any]  # JSONB: {"text": "..."} for user, AssistantPayload for assistant
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_content(cls, v: Any) -> dict:
+        """PostgREST returns TEXT columns as JSON strings. Parse them on the way in."""
+        if isinstance(v, str):
+            import json as _json
+            return _json.loads(v)
+        return v
 
 
 class ResponseMetadata(BaseModel):
