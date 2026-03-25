@@ -148,9 +148,16 @@ export type AssistantPayload = {
 
 export type ChatMode = "triage" | "summary" | "patient_message";
 
+export type ResponseMetadata = {
+  is_mock: boolean;
+  model: string;
+  prompt_version: string;
+};
+
 export type ChatApiResponse = {
   request_id: string;
   assistant_payload: AssistantPayload;
+  response_metadata: ResponseMetadata;
 };
 
 export async function createConversation(title: string): Promise<ConversationOut> {

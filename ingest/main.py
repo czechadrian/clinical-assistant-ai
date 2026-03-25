@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from guardrails import detect_pii
-from policy import SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
+from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
 
 load_dotenv()
@@ -32,11 +32,11 @@ logger = logging.getLogger(__name__)
 #                 validate it. No default auth headers; token is injected
 #                 per-request so each user's token is used in isolation.
 #
-# _db_client    — calls /rest/v1/* with the *service role* key. This key
-#                 bypasses RLS, which is intentional: we've already verified
-#                 the user upstream and will enforce ownership in the query
-#                 itself (e.g. user_id=eq.<verified_id>). Never expose this
-#                 key to the frontend.
+# _db_client    — calls /rest/v1/* using the service role key as *apikey*
+#                 (project identification at the API-gateway level only) and
+#                 injects the *user's* JWT as Authorization per-request so
+#                 PostgREST still evaluates RLS as that specific user.
+#                 Never expose the service role key to the frontend.
 #
 # Both are module-level singletons created at startup and closed at shutdown.
 # A single AsyncClient reuses its connection pool across all requests, which
@@ -218,9 +218,23 @@ class MessageOut(BaseModel):
     content: dict[str, Any]  # JSONB: {"text": "..."} for user, AssistantPayload for assistant
 
 
+class ResponseMetadata(BaseModel):
+    """Audit metadata returned alongside every chat response.
+
+    Lets callers (and audit logs) know exactly what produced the answer:
+    mock vs. real model, which model ID, and which prompt version was active.
+    Not stored in the messages table — it lives in ChatResponse only.
+    """
+
+    is_mock: bool
+    model: str  # "mock-v1" | "claude-opus-4-6" | etc.
+    prompt_version: str  # matches policy.PROMPT_VERSION
+
+
 class ChatResponse(BaseModel):
     request_id: str  # UUID v4 — use for logging and client-side deduplication
     assistant_payload: AssistantPayload
+    response_metadata: ResponseMetadata
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +250,7 @@ _DISCLAIMER = (
 )
 
 
-def _build_mock_payload(mode: str, input_text: str) -> AssistantPayload:
+def _build_mock_payload(mode: str) -> AssistantPayload:
     if mode == "triage":
         return AssistantPayload(
             questions_to_ask=[
@@ -397,6 +411,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
         extra={
             "request_id": request_id,
             "user_id": user_id,
+            "conversation_id": body.conversation_id,
             "mode": body.mode,
             "input_length": input_length,
         },
@@ -416,6 +431,13 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 "Please remove personal identifiers before submitting.",
             )
 
+        # 0.5 Feature flag — fail fast if LLM integration is not enabled ----
+        if not settings.chat_mock_mode:
+            raise HTTPException(
+                status.HTTP_501_NOT_IMPLEMENTED,
+                "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
+            )
+
         # 1. Verify the conversation exists and belongs to this user ---------
         # RLS enforces ownership; the explicit user_id filter is defence-in-depth.
         conv_rows = await _db_select(
@@ -424,7 +446,9 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             auth.jwt,
         )
         if not conv_rows:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Conversation not found or access denied")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
+            )
 
         # 2. Insert user message ---------------------------------------------
         await _db_insert(
@@ -441,7 +465,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
         # 3. Build structured mock reply -------------------------------------
         # TODO: replace with real Claude API call using SYSTEM_PROMPT once the
         #       Anthropic SDK is wired in. The schema and mock shapes are final.
-        payload = _build_mock_payload(body.mode, body.input_text)
+        payload = _build_mock_payload(body.mode)
 
         # 4. Insert assistant message ----------------------------------------
         await _db_insert(
@@ -455,7 +479,15 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             auth.jwt,
         )
 
-        return ChatResponse(request_id=request_id, assistant_payload=payload)
+        return ChatResponse(
+            request_id=request_id,
+            assistant_payload=payload,
+            response_metadata=ResponseMetadata(
+                is_mock=True,
+                model="mock-v1",
+                prompt_version=PROMPT_VERSION,
+            ),
+        )
 
     except HTTPException as exc:
         status_code = exc.status_code
@@ -473,9 +505,12 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             extra={
                 "request_id": request_id,
                 "user_id": user_id,
+                "conversation_id": body.conversation_id,
                 "mode": body.mode,
                 "input_length": input_length,
                 "status_code": status_code,
                 "latency_ms": round((time.perf_counter() - start) * 1000),
+                "is_mock": settings.chat_mock_mode,
+                "prompt_version": PROMPT_VERSION,
             },
         )

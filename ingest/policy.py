@@ -10,6 +10,10 @@ The actual Claude API call (replacing the mock) will drop this directly into
 the `system` parameter of `anthropic.messages.create(...)`.
 """
 
+# Increment when the policy text changes so responses can be traced to the
+# exact prompt version that generated them.
+PROMPT_VERSION = "1.0.0"
+
 SYSTEM_PROMPT = (
     "You are a clinical support assistant for Polish-speaking healthcare professionals.\n\n"
     # ------------------------------------------------------------------

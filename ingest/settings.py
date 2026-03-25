@@ -115,6 +115,7 @@ class Settings:
     cors_origin_regex: str | None
     app_env: str
     git_commit: str | None
+    chat_mock_mode: bool  # True → mock responses; False → 501 (no LLM yet)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -140,4 +141,5 @@ class Settings:
             cors_origin_regex=cors_origin_regex,
             app_env=os.getenv("APP_ENV", "local"),
             git_commit=_get_git_commit(),
+            chat_mock_mode=os.getenv("CHAT_MOCK_MODE", "true").lower() == "true",
         )
