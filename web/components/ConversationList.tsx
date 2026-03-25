@@ -1,13 +1,10 @@
 "use client";
 
 import { ApiStatus } from "@/components/ApiStatus";
+import { type ConversationOut } from "@/lib/api";
 
-export type Conversation = {
-  id: string;
-  title: string | null;  // null until set after first message
-  created_at: string;
-  updated_at: string;
-};
+// Re-export under the UI name so callers don't need to import from both places.
+export type Conversation = ConversationOut;
 
 type Props = {
   conversations: Conversation[];

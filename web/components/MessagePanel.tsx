@@ -151,6 +151,26 @@ const MODE_LABELS: Record<ChatMode, string> = {
   patient_message: "Patient message",
 };
 
+// Generic placeholder templates — fill the textarea on click.
+// No real medical content; clinician replaces bracketed values.
+const TEMPLATES: Record<ChatMode, string[]> = {
+  triage: [
+    "Patient presents with [symptom]. Duration: [time]. Vitals: BP [X/Y], HR [N], SpO2 [N]%.",
+    "Elderly patient, acute onset [symptom]. Known conditions: [list]. Current medications: [list].",
+    "Post-operative day [N]. Chief complaint: [symptom]. Temperature [X]°C, BP [X/Y].",
+  ],
+  summary: [
+    "Summarize visit: complaint [X], examination findings [Y], diagnosis [Z], plan [W].",
+    "Discharge summary for patient with [diagnosis]. Treatment: [treatment]. Follow-up: [plan].",
+    "Referral note to [specialty]: patient with [condition], reason for referral [reason].",
+  ],
+  patient_message: [
+    "Explain [diagnosis] in simple language and describe the prescribed treatment.",
+    "Post-procedure instructions for [procedure] — what to expect and when to seek help.",
+    "Side effects of [medication] the patient should monitor and report.",
+  ],
+};
+
 export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -161,8 +181,12 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Fetch messages whenever the selected conversation changes
+  // Fetch messages whenever the selected conversation changes.
+  // Also clear stale UI state so errors/title from a previous panel don't bleed over.
   useEffect(() => {
+    setError(null);
+    setNewTitle("");
+
     if (!conversationId) {
       setMessages([]);
       return;
@@ -205,26 +229,33 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
     setMessages((prev) => [...prev, optimisticUser]);
 
     try {
-      // If there's no conversation yet, create one.
-      // Use the explicit title if the user typed one; otherwise derive from the message.
+      // If there's no conversation yet, create one silently first.
+      // onConversationCreated is called AFTER postChat so that when the parent
+      // triggers a re-fetch of messages (via useEffect on conversationId change),
+      // both messages are already in the DB and the fetch returns them correctly.
       let convId = conversationId;
+      let createdId: string | null = null;
       if (!convId) {
         const title = newTitle.trim() || text.slice(0, 60);
         const conv = await createConversation(title);
         convId = conv.id;
-        setNewTitle("");
-        onConversationCreated(convId);
+        createdId = conv.id;
       }
 
       const result = await postChat(text, convId, mode);
 
-      // Replace the optimistic user bubble + append assistant reply.
+      // Replace the optimistic user bubble and append the assistant reply.
       const optimisticAssistant: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
         content: result.assistant_payload,
       };
       setMessages((prev) => [...prev.slice(0, -1), optimisticUser, optimisticAssistant]);
+
+      // Notify parent now that messages are persisted — the resulting
+      // conversationId prop change triggers useEffect which re-fetches
+      // from DB (already populated) without a visible flash.
+      if (createdId) onConversationCreated(createdId);
     } catch (err) {
       // Roll back the optimistic message and restore the draft.
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUser.id));
@@ -313,6 +344,21 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
               }`}
             >
               {MODE_LABELS[m]}
+            </button>
+          ))}
+        </div>
+
+        {/* Template buttons — click to pre-fill the textarea */}
+        <div className="mb-2 flex flex-wrap gap-1">
+          {TEMPLATES[mode].map((tpl, i) => (
+            <button
+              key={i}
+              type="button"
+              disabled={sending}
+              onClick={() => setInput(tpl)}
+              className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500 dark:hover:text-zinc-200"
+            >
+              Template {i + 1}
             </button>
           ))}
         </div>

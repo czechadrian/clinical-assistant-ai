@@ -21,7 +21,7 @@ export default function AppPage() {
   // Fetch conversations via the backend so RLS is enforced through the API layer.
   async function fetchConversations() {
     const data = await listConversations().catch(() => []);
-    setConversations(data as Conversation[]);
+    setConversations(data);
   }
 
   useEffect(() => {
