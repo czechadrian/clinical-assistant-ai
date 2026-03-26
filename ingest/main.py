@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
-from guardrails import detect_pii
+from guardrails import detect_pii, detect_unsafe_request, is_vague_input
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
 
@@ -247,6 +247,7 @@ class MessageOut(BaseModel):
         """PostgREST returns TEXT columns as JSON strings. Parse them on the way in."""
         if isinstance(v, str):
             import json as _json
+
             return _json.loads(v)
         return v
 
@@ -350,6 +351,38 @@ def _build_mock_payload(mode: str) -> AssistantPayload:
         sources=[],
         flag="safe",
         disclaimer="Te informacje maja charakter pomocniczy i nie zastepuja indywidualnej porady lekarskiej.",
+    )
+
+
+def _build_refuse_payload() -> AssistantPayload:
+    """Returned when the request is unsafe or out-of-scope (flag='refuse')."""
+    return AssistantPayload(
+        questions_to_ask=[],
+        red_flags=[],
+        possible_next_steps=[],
+        patient_facing_summary="",
+        sources=[],
+        flag="refuse",
+        disclaimer=_DISCLAIMER,
+    )
+
+
+def _build_uncertain_payload() -> AssistantPayload:
+    """Returned when the input is too vague to act on (flag='uncertain')."""
+    return AssistantPayload(
+        questions_to_ask=[
+            "Proszę podać główny objaw lub dolegliwość pacjenta.",
+            "Od jak dawna pacjent odczuwa dolegliwości?",
+            "Czy występują objawy towarzyszące (np. ból, gorączka, duszność)?",
+            "Jakie leki przyjmuje pacjent na stałe?",
+            "Czy pacjent był hospitalizowany lub operowany w przeszłości?",
+        ],
+        red_flags=[],
+        possible_next_steps=["Proszę o podanie bardziej szczegółowych informacji klinicznych."],
+        patient_facing_summary="",
+        sources=[],
+        flag="uncertain",
+        disclaimer=_DISCLAIMER,
     )
 
 
@@ -495,10 +528,24 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             auth.jwt,
         )
 
-        # 3. Build structured mock reply -------------------------------------
-        # TODO: replace with real Claude API call using SYSTEM_PROMPT once the
-        #       Anthropic SDK is wired in. The schema and mock shapes are final.
-        payload = _build_mock_payload(body.mode)
+        # 3. Route to appropriate payload ------------------------------------
+        # Unsafe requests (injection attempts, out-of-scope) → refuse.
+        # Vague inputs (< 5 words) → uncertain with clarifying questions.
+        # Everything else → mode-specific mock payload.
+        # TODO: replace _build_mock_payload with a real Claude API call using
+        #       SYSTEM_PROMPT once the Anthropic SDK is wired in.
+        unsafe_label = detect_unsafe_request(body.input_text)
+        if unsafe_label:
+            logger.warning(
+                "unsafe_request_refused",
+                extra={"request_id": request_id, "unsafe_reason": unsafe_label},
+            )
+            payload = _build_refuse_payload()
+        elif is_vague_input(body.input_text):
+            logger.info("vague_input_uncertain", extra={"request_id": request_id})
+            payload = _build_uncertain_payload()
+        else:
+            payload = _build_mock_payload(body.mode)
 
         # 4. Insert assistant message ----------------------------------------
         await _db_insert(
