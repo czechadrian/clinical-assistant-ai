@@ -87,7 +87,17 @@ export async function apiFetch<T = unknown>(
       },
     });
 
-  let res = await request(token);
+  let res: Response;
+  try {
+    res = await request(token);
+  } catch {
+    // fetch() throws TypeError when the network is unreachable or the server
+    // is down. Convert to ApiError so the UI shows a readable message.
+    throw new ApiError(
+      "The API service is unreachable. Please try again later.",
+      0,
+    );
+  }
 
   // The server rejected the token. This happens when:
   // - The token expired between our getSession() call and the server validating it.
@@ -95,7 +105,14 @@ export async function apiFetch<T = unknown>(
   // Force a fresh token from Supabase and retry exactly once.
   if (res.status === 401) {
     token = await refreshAccessToken();
-    res = await request(token);
+    try {
+      res = await request(token);
+    } catch {
+      throw new ApiError(
+        "The API service is unreachable. Please try again later.",
+        0,
+      );
+    }
   }
 
   if (!res.ok) {
