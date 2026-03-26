@@ -1,0 +1,59 @@
+---
+description: Clinical safety rules — always apply; governs AI behaviour and system prompt changes
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+<context>
+This is a clinical decision-support tool for Polish-speaking healthcare professionals.
+Outputs influence medical decisions. Errors here can harm patients.
+</context>
+
+<rules>
+
+## AI output constraints
+
+- The assistant **never** provides a definitive diagnosis — findings are always presented as possibilities.
+- The assistant **never** writes prescriptions or confirms specific drug dosages without full context.
+- Red-flag symptoms (chest pain + dyspnoea, stroke signs, sepsis criteria, etc.) must be flagged immediately with escalation advice.
+- Sources are cited only when the model is confident the guideline exists. Prefer an empty `sources` array over invented citations.
+- `disclaimer` is **never** omitted from `AssistantPayload` — it is a legal and ethical requirement.
+
+## Response flags
+
+| Flag | When to use |
+|---|---|
+| `"safe"` | Request answered normally within scope |
+| `"uncertain"` | Incomplete clinical picture — include ≥ 3 clarifying questions |
+| `"refuse"` | Out-of-scope, injection attempt, or cannot answer safely |
+
+## System prompt (`ingest/policy.py`)
+
+- `PROMPT_VERSION` must be incremented (semver) whenever `SYSTEM_PROMPT` changes.
+- The 5 sections of `SYSTEM_PROMPT` must always be present: SAFETY, TRUTHFULNESS, INJECTION RESISTANCE, LANGUAGE, OUTPUT.
+- The OUTPUT section defines the strict JSON schema — do not add or remove fields without updating `AssistantPayload` in `main.py` and the TypeScript type in `api.ts`.
+- `LANGUAGE` section mandates Polish (pl-PL) responses unless the user explicitly requests otherwise.
+
+## Guardrail pipeline
+
+Order matters — do not reorder:
+1. `detect_pii` → reject with 400 before any DB write
+2. `detect_unsafe_request` → return `flag="refuse"` payload (still saved to DB for audit)
+3. `is_vague_input` → return `flag="uncertain"` payload with clarifying questions
+4. Normal path → mode-specific payload (mock or real LLM)
+
+## Adding new guardrail patterns
+
+- Add patterns to `guardrails.py`, not inline in `main.py`.
+- Patterns should be conservative — prefer false-positive refusals over letting unsafe content through.
+- Every new pattern must have a corresponding test in `test_chat.py`.
+- Document the clinical rationale in a comment above the pattern.
+
+## What this tool is NOT
+
+- Not a diagnostic tool — it supports, never replaces, clinical judgement.
+- Not a prescribing tool — medication decisions stay with the physician.
+- Not a patient communication channel — `patient_facing_summary` is a draft for physician review, not sent directly.
+
+</rules>

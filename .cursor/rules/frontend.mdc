@@ -1,0 +1,61 @@
+---
+description: Next.js / TypeScript rules for the web frontend
+globs:
+  - web/**/*.ts
+  - web/**/*.tsx
+alwaysApply: false
+---
+
+<context>
+Next.js 16 App Router (TypeScript, pnpm). Auth via Supabase JS client.
+All backend communication goes through `web/lib/api.ts` using `apiFetch`.
+</context>
+
+<rules>
+
+## TypeScript
+
+- Run `pnpm exec tsc --noEmit` before marking any change as done. Zero type errors required.
+- Prefer explicit return types on exported functions.
+- Use `unknown` over `any` for untrusted data. Use `as T` casts only after validation.
+- No duplicate type definitions — `Conversation` in `ConversationList.tsx` is a re-export of `ConversationOut` from `api.ts`.
+
+## API calls
+
+- All backend calls go through `apiFetch<T>` in `web/lib/api.ts` — never call `fetch()` directly.
+- Catch `NoSessionError` at the page level and redirect to `/login` via `router.replace`.
+- Surface `ApiError` to the user with its `.message`. Log the `.status` if useful.
+- Network errors (status 0) mean the backend is unreachable — show a friendly message, never a stack trace.
+
+## React / Next.js
+
+- Mark client components with `"use client"` at the top — App Router defaults to server components.
+- Async `useEffect`: always return a cleanup function with a `cancelled` flag to prevent state updates after unmount:
+  ```ts
+  useEffect(() => {
+    let cancelled = false;
+    async function run() { ... if (cancelled) return; ... }
+    void run();
+    return () => { cancelled = true; };
+  }, [deps]);
+  ```
+- Optimistic UI: add the user bubble immediately, roll back on error.
+- Call `onConversationCreated` **after** `postChat` resolves — not before — to avoid race conditions where `getMessages` fires before the message is saved.
+
+## State management
+
+- Keep state at the lowest component that needs it.
+- Avoid derived state — compute from existing state in render when possible.
+- `selectedId: string | null` — null means "new conversation" view.
+
+## Styling
+
+- Tailwind utility classes only. No inline styles, no CSS modules.
+- Responsive by default; use `dark:` variants for dark mode.
+
+## No-go
+
+- No direct Supabase DB calls for chat data from components — always route through FastAPI.
+- No `NEXT_PUBLIC_*` env vars for secrets — service role key must never reach the browser.
+- No `console.log` in production code — use error boundaries or user-visible error state.
+</rules>

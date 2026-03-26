@@ -1,0 +1,60 @@
+---
+description: FastAPI / Python rules for the ingest backend service
+globs:
+  - ingest/**/*.py
+alwaysApply: false
+---
+
+<context>
+FastAPI backend (Python 3.11, uv). Calls Supabase PostgREST with per-request JWT for RLS enforcement.
+All configuration is read in `settings.py`; never access `os.environ` directly in `main.py`.
+</context>
+
+<rules>
+
+## Code style
+
+- Python 3.11+ syntax only: `str | None`, `list[str]`, `dict[str, Any]` — never `Optional`, `List`, `Dict`.
+- All public functions must have type annotations on parameters and return type.
+- Line length limit: 100 (configured in `ruff`). Run `ruff format ingest/` after any edit.
+- Docstrings only on functions with non-obvious behaviour. Skip trivial getters.
+
+## FastAPI patterns
+
+- Route handlers are `async def`. DB + network calls must use `await`.
+- Validation lives in Pydantic models (`Field(min_length=1, max_length=2000)`), not in route bodies.
+- Use `status.HTTP_*` constants — never raw integers like `400` or `500` in `raise HTTPException`.
+- Return Pydantic `response_model` on all routes that return structured data.
+- New endpoints: `auth: Auth = Depends(get_auth)`. Never use the legacy `get_supabase_user`.
+- Never trust `user_id` from the request body — always use `auth.user_id`.
+
+## Database
+
+- All reads go through `_db_select(path, params, jwt)`.
+- All writes go through `_db_insert(table, row, jwt)`.
+- Always pass `auth.jwt` — this injects `Authorization: Bearer <jwt>` so PostgREST evaluates RLS.
+- Never set `Authorization` on the shared `_db_client` object — it is stateless by design.
+
+## Logging
+
+Safe fields only: `request_id`, `user_id`, `conversation_id`, `mode`, `input_length`,
+`latency_ms`, `status_code`, `is_mock`, `prompt_version`.
+
+**Never log:** `input_text`, assistant response content, or any field that could contain patient data.
+
+## Testing
+
+- Every guardrail function must be testable without FastAPI (`side-effect-free`).
+- Mock `_db_select` / `_db_insert` with `AsyncMock` — never hit a real database.
+- After any backend change: `uv run --project ingest pytest ingest/tests/ -v` must pass.
+- New guardrail path → new test case in `test_chat.py`.
+
+## Guardrails
+
+Three layers in order (all in `guardrails.py`):
+1. `detect_pii(text)` — PII → 400
+2. `detect_unsafe_request(text)` — injection/out-of-scope → `flag="refuse"` payload
+3. `is_vague_input(text)` — < 5 words → `flag="uncertain"` payload
+
+Add new patterns to the appropriate function; never add guardrail logic directly in endpoint code.
+</rules>

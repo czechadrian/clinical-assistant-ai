@@ -1,0 +1,56 @@
+---
+description: Security and privacy rules — always apply across the entire codebase
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+<context>
+Medical SaaS handling clinical conversations. These constraints are non-negotiable.
+Violations may breach RODO (Polish GDPR) and put patients at risk.
+</context>
+
+<rules>
+
+## Authentication & authorisation
+
+- Service role key is **only** used as `apikey` (project identifier at the API-gateway layer).
+- User JWT is injected per-request as `Authorization: Bearer <jwt>` — PostgREST evaluates RLS.
+- Every data endpoint uses `Auth = Depends(get_auth)` — never trust client-supplied `user_id`.
+- `SUPABASE_SERVICE_ROLE_KEY` must never appear in any `NEXT_PUBLIC_*` variable or browser bundle.
+
+## Row-Level Security
+
+- RLS is the primary access control — never bypass it with service-role queries in application code.
+- When a resource query returns `[]`, surface it as 404 (not 403) — avoids user enumeration.
+- Schema changes must include RLS policy updates in `supabase/schema.sql`.
+
+## Logging — zero patient data
+
+- **Banned from logs:** `input_text`, assistant response body, conversation titles, any free-text field.
+- **Allowed:** `request_id`, `user_id`, `conversation_id`, `mode`, `input_length`, `latency_ms`, `status_code`, `is_mock`, `prompt_version`.
+- `input_length` (character count) is safe; the string itself is not.
+
+## Input validation pipeline
+
+All three guardrail functions run **before any DB write** in `/chat`:
+1. `detect_pii` — PII found → 400
+2. `detect_unsafe_request` — injection/out-of-scope → `flag="refuse"` (DB write still happens for audit)
+3. `is_vague_input` — < 5 words → `flag="uncertain"`
+
+## HTTP security headers (Next.js)
+
+Required on all routes:
+- `Content-Security-Policy` with `connect-src 'self' *.supabase.co <BACKEND_URL>`
+- `X-Frame-Options: DENY`
+- `X-Content-Type-Options: nosniff`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `frame-ancestors 'none'`
+
+## Secrets
+
+- `.env` and `.env.local` are gitignored — never commit real credentials.
+- Flag any string that looks like a key (`sk-`, `eyJ`, long random hex) in code review.
+- No hardcoded URLs, tokens, or connection strings in source files.
+
+</rules>

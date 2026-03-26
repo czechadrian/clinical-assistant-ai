@@ -1,103 +1,128 @@
-# Kliniczny Asystent AI — Claude Code Guide
+# Kliniczny Asystent AI
 
+<project>
 Clinical decision-support assistant for Polish-speaking healthcare professionals.
-**Week 1 complete** (Days 1–6): auth, conversations, messages, mock LLM, PII guardrail, RLS.
-**Next milestone**: real Claude API integration (replace mock in `/ingest/main.py`).
+Medical context: responses affect clinical decisions — correctness, privacy, and safety are non-negotiable.
+
+Status: Week 1 complete (auth, conversations, messages, mock LLM, PII + unsafe + vague guardrails, RLS, tests).
+Next milestone: real Claude API integration (Week 2).
+</project>
 
 ---
 
-## Architecture
+<architecture>
 
 ```
-/ingest   FastAPI backend (Python 3.11, uv)          → port 8000
-/web      Next.js 16 App Router (TypeScript, pnpm)   → port 3000
-Supabase  Auth + Postgres + RLS (no direct Postgres connection)
+/ingest   FastAPI backend (Python 3.11, uv)     → port 8000
+/web      Next.js 16 App Router (TypeScript)     → port 3000
+Supabase  Auth + Postgres + RLS                  → no direct DB connections in app code
 ```
 
-The frontend never touches the DB directly for chat — it calls the FastAPI backend.
-Auth is via Supabase JS client; the backend validates the Supabase JWT on every request.
+Data flow: `frontend → FastAPI (JWT validated) → PostgREST (RLS enforced) → Postgres`
+Auth: Supabase JWT issued on login, validated on every backend request via `/auth/v1/user`.
+The frontend **never** touches the DB directly for chat — always through FastAPI.
+</architecture>
 
 ---
 
-## Commands
+<commands>
 
 ### Backend
 ```bash
-# Dev server
-uv run --project ingest uvicorn main:app --reload --app-dir ingest
-
-# Tests
-uv run --project ingest pytest ingest/tests/ -v
-
-# Lint + format check
-uv run --project ingest ruff check ingest/
-uv run --project ingest ruff format --check ingest/
-uv run --project ingest ruff format ingest/   # auto-fix
+uv run --project ingest uvicorn main:app --reload --app-dir ingest   # dev server
+uv run --project ingest pytest ingest/tests/ -v                      # tests (currently 6)
+uv run --project ingest ruff check ingest/                           # lint
+uv run --project ingest ruff format ingest/                          # format
 ```
 
 ### Frontend
 ```bash
-cd web
-pnpm dev
-pnpm exec tsc --noEmit    # type check
+cd web && pnpm dev
+pnpm exec tsc --noEmit    # type-check — run before considering any TS change done
 pnpm lint
 ```
+</commands>
 
 ---
 
-## Environment variables
+<key_files>
+
+| Path | Purpose |
+|---|---|
+| `ingest/main.py` | All FastAPI endpoints, `Auth`, DB helpers, payload builders |
+| `ingest/settings.py` | `Settings.from_env()` + `JsonFormatter` + structured logging |
+| `ingest/guardrails.py` | `detect_pii`, `detect_unsafe_request`, `is_vague_input` |
+| `ingest/policy.py` | `SYSTEM_PROMPT` + `PROMPT_VERSION` — bump version on every prompt change |
+| `ingest/tests/conftest.py` | Fake env + `get_auth` override; never hits real Supabase |
+| `ingest/tests/test_chat.py` | 6 smoke tests covering all guardrail paths |
+| `web/lib/api.ts` | All typed fetch calls + `NoSessionError`, `ApiError`, retry on 401 |
+| `web/components/MessagePanel.tsx` | Chat UI: composer, mode selector, templates, optimistic update |
+| `web/components/ConversationList.tsx` | Left sidebar; re-exports `Conversation = ConversationOut` |
+| `supabase/schema.sql` | Canonical schema: tables, RLS policies, indexes, trigger (idempotent) |
+</key_files>
+
+---
+
+<env_vars>
 
 ### Backend (`ingest/.env`)
 ```
 SUPABASE_URL=https://<project>.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=<service_role_key>   # never expose to frontend
-ANTHROPIC_API_KEY=<key>                         # unused until Week 2
-CHAT_MOCK_MODE=true                             # false → 501 Not Implemented
-APP_ENV=local                                   # local | production
+SUPABASE_SERVICE_ROLE_KEY=<key>   # project-ID only — NEVER pass to frontend
+ANTHROPIC_API_KEY=<key>           # wired in Week 2
+CHAT_MOCK_MODE=true               # false → 501 Not Implemented
+APP_ENV=local                     # local | production
 ALLOWED_ORIGINS=http://localhost:3000
 ```
 
 ### Frontend (`web/.env.local`)
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://<project>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon_key>       # public, safe for browser
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon_key>   # safe for browser
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
 ```
+</env_vars>
 
 ---
 
-## Key files
+<rules>
 
-| Path | Purpose |
-|---|---|
-| `ingest/main.py` | All FastAPI endpoints, auth dependency, DB helpers |
-| `ingest/settings.py` | `Settings.from_env()` + structured JSON logging |
-| `ingest/guardrails.py` | PII detection (email, phone, PESEL, NIP) |
-| `ingest/policy.py` | `SYSTEM_PROMPT` + `PROMPT_VERSION` constant |
-| `ingest/tests/` | pytest smoke tests; conftest sets fake env vars |
-| `web/lib/api.ts` | All typed fetch calls to the backend |
-| `web/components/MessagePanel.tsx` | Main chat UI: composer, mode selector, templates |
-| `web/components/ConversationList.tsx` | Left sidebar |
-| `supabase/schema.sql` | Canonical schema: tables, RLS policies, indexes, trigger |
-| `supabase/test_rls.sh` | Curl-based RLS smoke test |
+### Python / FastAPI
+
+- Always run `ruff check` + `ruff format` after any backend change.
+- Type-annotate all function signatures. Use `str | None` (union syntax), never `Optional[str]`.
+- Pydantic models are the source of truth for request/response shapes — validate at the boundary, trust internally.
+- Never read `os.environ` in `main.py` — all env access goes through `settings.py`.
+- All DB access via `_db_insert` / `_db_select` helpers — never call `_db_client` directly in endpoints.
+- Inject user JWT per-request via `_rls_headers(jwt)` — never set `Authorization` on the shared `_db_client`.
+- New endpoints must use `Auth = Depends(get_auth)` — `get_supabase_user` is legacy (only `/whoami`).
+- Never derive `user_id` from the request body — always use `auth.user_id` from the validated `Auth` dependency.
+- Log only safe fields: `request_id`, `user_id`, `conversation_id`, `mode`, `input_length`, `latency_ms`, `status_code`, `is_mock`, `prompt_version`. Never log `input_text` or any assistant content.
+- Guardrail functions must be side-effect-free so they are testable without FastAPI.
+
+### TypeScript / Next.js
+
+- Run `pnpm exec tsc --noEmit` before marking any TypeScript change as done.
+- All backend calls go through `apiFetch` in `web/lib/api.ts` — never call `fetch()` directly in components.
+- `Conversation` in components is a re-export of `ConversationOut` from `api.ts` — no duplicate type definitions.
+- Catch `NoSessionError` at the page level and redirect to `/login`. Surface `ApiError` in the UI.
+- Always return a cleanup function from async `useEffect` — `() => { cancelled = true }` prevents stale state.
+- No direct Supabase DB calls from components for chat data — always go through FastAPI.
+
+### Testing
+
+- Every new guardrail behaviour needs a corresponding test in `test_chat.py`.
+- Patch `_db_select` / `_db_insert` with `AsyncMock` — tests never touch a real database.
+- `conftest.py` overrides `get_auth` — tests never need a real JWT or Supabase connection.
+- After adding tests, confirm the full suite passes: `uv run --project ingest pytest ingest/tests/ -v`.
+
+</rules>
 
 ---
 
-## Critical conventions
+<response_schema>
 
-### Security / RLS
-- The backend uses the service role key **only as `apikey`** (API-gateway project ID).
-- The user's JWT is injected per-request as `Authorization: Bearer <jwt>` so PostgREST enforces RLS.
-- Never trust `user_id` from the request body — always use the validated `Auth.user_id`.
-- Never expose `SUPABASE_SERVICE_ROLE_KEY` to any frontend code.
-
-### Privacy / logging
-- Never log `input_text`, assistant content, or any patient data.
-- Log only: `request_id`, `user_id`, `conversation_id`, `mode`, `input_length`, `latency_ms`, `status_code`, `is_mock`, `prompt_version`.
-- PII guardrail runs **before any DB write** in `/chat`.
-
-### Response schema
-Every `/chat` response must return a valid `AssistantPayload`:
+Every `/chat` response must include a valid `AssistantPayload`:
 ```json
 {
   "questions_to_ask": [],
@@ -110,40 +135,54 @@ Every `/chat` response must return a valid `AssistantPayload`:
 }
 ```
 
-### AI metadata
-Every `ChatResponse` includes `response_metadata: {is_mock, model, prompt_version}`.
-When replacing the mock with a real Claude call, set `is_mock=False` and `model="claude-opus-4-6"`.
-Increment `PROMPT_VERSION` in `ingest/policy.py` whenever `SYSTEM_PROMPT` changes.
+`ChatResponse` always includes `response_metadata: { is_mock, model, prompt_version }`.
+
+`/chat` routing order:
+1. PII detected → `400 Bad Request`
+2. `CHAT_MOCK_MODE=false` → `501 Not Implemented`
+3. Conversation not owned by user → `403 Forbidden`
+4. Unsafe request (injection / out-of-scope) → `200` with `flag="refuse"`
+5. Vague input (< 5 words) → `200` with `flag="uncertain"` + clarifying questions
+6. Normal → `200` with mode-specific payload
+</response_schema>
 
 ---
 
-## What NOT to do
+<forbidden>
 
-- **No Prisma** — schema is owned by `supabase/schema.sql` + PostgREST. Prisma would require duplicating RLS in application code.
+- **No service role key bypass** — always pass user JWT so PostgREST evaluates RLS as that user.
+- **No patient text in logs** — `input_text` and assistant content are permanently off-limits.
+- **No Prisma** — schema is owned by `supabase/schema.sql`. Prisma would require duplicating RLS in app code.
 - **No tRPC** — backend is Python/FastAPI, not Node.js.
-- **No service role key bypass** — always pass user JWT; let RLS do its job.
-- **No LLM calls yet** — `CHAT_MOCK_MODE=false` returns 501 intentionally. Week 2 only.
-- **No raw patient text in logs** — ever.
+- **No real LLM calls yet** — `CHAT_MOCK_MODE=false` returns 501 intentionally. Week 2 only.
+- **No `user_id` from request body** — always derive from `Auth.user_id` (validated server-side).
+- **No `NEXT_PUBLIC_*` for secrets** — the service role key must never reach the browser bundle.
+- **No direct DB queries for chat from the frontend** — always route through FastAPI for RLS enforcement.
+</forbidden>
 
 ---
 
-## DB schema summary
+<db_schema>
 
 Three tables in `public`:
-- `profiles (id, email)` — one row per Supabase auth user; upserted on login
+- `profiles (id, email)` — one row per auth user; upserted on login
 - `conversations (id, user_id, title, created_at, updated_at)` — `updated_at` bumped by trigger on message insert
 - `messages (id, conversation_id, user_id, role, content jsonb, created_at)`
 
-RLS is enabled on all three. Every policy filters by `auth.uid() = user_id`.
-
-To apply the schema: run `supabase/schema.sql` in the Supabase SQL editor (idempotent).
+RLS enabled on all three. Every policy: `auth.uid() = user_id`.
+Apply schema: paste `supabase/schema.sql` into Supabase SQL editor (idempotent).
+</db_schema>
 
 ---
 
-## Week 2 checklist (not started)
+<week2_checklist>
 
-- [ ] Wire `anthropic` SDK: replace `_build_mock_payload` with real `messages.create` call
+- [ ] Add `anthropic>=0.25` to `ingest/pyproject.toml` dependencies
+- [ ] Replace `_build_mock_payload` with real `anthropic.messages.create` call using `SYSTEM_PROMPT`
+- [ ] Validate Claude's JSON output into `AssistantPayload` via Pydantic (catch `ValidationError`)
+- [ ] Set `is_mock=False`, `model="claude-opus-4-6"` in `ResponseMetadata`
 - [ ] Set `CHAT_MOCK_MODE=false` in production env
-- [ ] Set `response_metadata.is_mock=False`, `model="claude-opus-4-6"`
-- [ ] Add streaming support to `/chat` (SSE or chunked)
-- [ ] Rate limiting (`slowapi` for FastAPI)
+- [ ] Increment `PROMPT_VERSION` in `policy.py` when `SYSTEM_PROMPT` changes
+- [ ] Add `/chat/stream` SSE endpoint for streaming responses
+- [ ] Rate limiting via `slowapi`
+</week2_checklist>

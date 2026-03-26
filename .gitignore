@@ -12,7 +12,8 @@ __pycache__
 
 # misc
 .DS_Store
-.cursor
+# .cursor/rules/ is intentionally tracked — project coding standards for Cursor IDE
+.cursor/settings.json
 
 # secrets — never commit real env files
 .env
