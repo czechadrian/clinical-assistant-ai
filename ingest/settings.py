@@ -116,6 +116,9 @@ class Settings:
     app_env: str
     git_commit: str | None
     chat_mock_mode: bool  # True → mock responses; False → 501 (no LLM yet)
+    # OPTIONAL — validation_debug: if True, the HTTP 500 body includes the invalid
+    # field paths (never values).  Set only in local dev; must stay False in prod.
+    validation_debug: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -142,4 +145,5 @@ class Settings:
             app_env=os.getenv("APP_ENV", "local"),
             git_commit=_get_git_commit(),
             chat_mock_mode=os.getenv("CHAT_MOCK_MODE", "true").lower() == "true",
+            validation_debug=os.getenv("VALIDATION_DEBUG", "false").lower() == "true",
         )

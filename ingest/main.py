@@ -10,11 +10,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from classifier import ClassifiedInput, classify_input  # noqa: F401
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
+from validator import validate_and_repair
 
 load_dotenv()
 
@@ -354,6 +355,27 @@ def _build_mock_payload(mode: str) -> AssistantPayload:
     )
 
 
+def _build_raw_payload(mode: str, classified: ClassifiedInput) -> dict[str, Any]:
+    """
+    Return the assistant payload as a raw dict for validation.
+
+    This is the single seam for Week 2: replace the function body with:
+        raw_json = await anthropic_client.messages.create(
+            model="claude-opus-4-6",
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": classified.for_llm()}],
+        )
+        return json.loads(raw_json.content[0].text)
+
+    Patchable in tests — patch "main._build_raw_payload" to inject invalid dicts.
+    """
+    if classified.is_unsafe_request:
+        return _build_refuse_payload().model_dump()
+    if classified.is_vague:
+        return _build_uncertain_payload().model_dump()
+    return _build_mock_payload(mode).model_dump()
+
+
 def _build_refuse_payload() -> AssistantPayload:
     """Returned when the request is unsafe or out-of-scope (flag='refuse')."""
     return AssistantPayload(
@@ -553,25 +575,45 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             auth.jwt,
         )
 
-        # 3. Route to payload ------------------------------------------------
-        # Unsafe request → refuse  (explicit medical out-of-scope)
-        # Vague input    → uncertain + clarifying questions
-        # Injection only → normal path (injection is flagged, not refused)
-        # TODO (Week 2): replace _build_mock_payload with:
-        #   classified.for_llm() → wrapped in <clinical_query> tags for Claude
+        # 3. Build raw payload dict -------------------------------------------
+        # Log the routing decision before building; _build_raw_payload is pure.
         if classified.is_unsafe_request:
-            logger.warning(
-                "unsafe_request_refused",
-                extra={"request_id": request_id},
-            )
-            payload = _build_refuse_payload()
+            logger.warning("unsafe_request_refused", extra={"request_id": request_id})
         elif classified.is_vague:
             logger.info("vague_input_uncertain", extra={"request_id": request_id})
-            payload = _build_uncertain_payload()
-        else:
-            payload = _build_mock_payload(body.mode)
 
-        # 4. Insert assistant message ----------------------------------------
+        raw_dict = _build_raw_payload(body.mode, classified)
+
+        # 4. Validate — repair once if needed — validate again ----------------
+        # On success: payload is a valid AssistantPayload; repair_applied records whether
+        # coercions were needed.  On failure: 500 with a safe message (no raw content).
+        try:
+            payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
+        except ValidationError as exc:
+            logger.error(
+                "payload_validation_failed",
+                extra={
+                    "request_id": request_id,
+                    "validation_error_code": "schema_invalid_after_repair",
+                    # error_count is a safe integer; field paths omitted (could hint at content)
+                    "error_count": exc.error_count(),
+                },
+            )
+            safe_detail = "Assistant response did not meet the required schema. Please retry."
+            if settings.validation_debug:
+                # Field paths + error types only — never the raw invalid values.
+                error_locs = [
+                    f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}"
+                    for e in exc.errors()
+                ]
+                safe_detail = f"{safe_detail} [debug] Invalid fields: {error_locs}"
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, safe_detail) from None
+
+        if repair_applied:
+            logger.warning("payload_repaired", extra={"request_id": request_id})
+
+        # 5. Insert assistant message — validation must pass before storage ---
+        # Raw invalid output is never stored; only the repaired-and-validated payload.
         await _db_insert(
             "messages",
             {
@@ -583,6 +625,8 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                         "prompt_version": PROMPT_VERSION,
                         "model": "mock-v1",
                         "is_mock": True,
+                        "validation_status": "valid",
+                        "repair_applied": repair_applied,
                     },
                 },
                 "user_id": user_id,
