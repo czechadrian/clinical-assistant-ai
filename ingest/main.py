@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
-from guardrails import detect_pii, detect_unsafe_request, is_vague_input
+from classifier import ClassifiedInput, classify_input  # noqa: F401
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
 
@@ -470,6 +470,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
     user_id = auth.user_id
     input_length = len(body.input_text)
     status_code = 200
+    classified: ClassifiedInput | None = None  # set in try block; read safely in finally
 
     # Logged on arrival — never includes raw content.
     logger.info(
@@ -484,28 +485,40 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
     )
 
     try:
-        # 0. PII guardrail — fail fast before any DB write -------------------
-        pii_label = detect_pii(body.input_text)
-        if pii_label:
+        # 0. Classify input — single pass over all checks -------------------
+        # Returns a typed object; raw body.input_text is never read again.
+        classified = classify_input(body.input_text)
+
+        # 0a. PII — abort before any DB write --------------------------------
+        if classified.pii_flags:
             logger.warning(
                 "pii_rejected",
-                extra={"request_id": request_id, "pii_type": pii_label},
+                extra={"request_id": request_id, "pii_type": classified.pii_flags[0]},
             )
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                f"Potentially identifying patient data detected ({pii_label}). "
+                f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
                 "Please remove personal identifiers before submitting.",
             )
 
-        # 0.5 Feature flag — fail fast if LLM integration is not enabled ----
+        # 0b. Injection detected — log and continue (non-blocking) ----------
+        if classified.has_injection:
+            logger.warning(
+                "injection_detected",
+                extra={
+                    "request_id": request_id,
+                    "injection_flags": classified.injection_flags,
+                },
+            )
+
+        # 0.5 Feature flag ---------------------------------------------------
         if not settings.chat_mock_mode:
             raise HTTPException(
                 status.HTTP_501_NOT_IMPLEMENTED,
                 "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
             )
 
-        # 1. Verify the conversation exists and belongs to this user ---------
-        # RLS enforces ownership; the explicit user_id filter is defence-in-depth.
+        # 1. Verify conversation ownership -----------------------------------
         conv_rows = await _db_select(
             "/conversations",
             {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
@@ -516,32 +529,43 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
             )
 
-        # 2. Insert user message ---------------------------------------------
+        # 2. Insert user message — include classification metadata -----------
+        # _meta stores flag labels and a content-hash for audit.
+        # It never stores raw flagged substrings or patient text.
         await _db_insert(
             "messages",
             {
                 "conversation_id": body.conversation_id,
                 "role": "user",
-                "content": {"text": body.input_text, "mode": body.mode},
+                "content": {
+                    "text": body.input_text,
+                    "mode": body.mode,
+                    "_meta": {
+                        "input_hash": classified.input_hash,
+                        "injection_flags": classified.injection_flags,
+                        "is_vague": classified.is_vague,
+                        "is_unsafe_request": classified.is_unsafe_request,
+                        "prompt_version": PROMPT_VERSION,
+                    },
+                },
                 "user_id": user_id,
             },
             auth.jwt,
         )
 
-        # 3. Route to appropriate payload ------------------------------------
-        # Unsafe requests (injection attempts, out-of-scope) → refuse.
-        # Vague inputs (< 5 words) → uncertain with clarifying questions.
-        # Everything else → mode-specific mock payload.
-        # TODO: replace _build_mock_payload with a real Claude API call using
-        #       SYSTEM_PROMPT once the Anthropic SDK is wired in.
-        unsafe_label = detect_unsafe_request(body.input_text)
-        if unsafe_label:
+        # 3. Route to payload ------------------------------------------------
+        # Unsafe request → refuse  (explicit medical out-of-scope)
+        # Vague input    → uncertain + clarifying questions
+        # Injection only → normal path (injection is flagged, not refused)
+        # TODO (Week 2): replace _build_mock_payload with:
+        #   classified.for_llm() → wrapped in <clinical_query> tags for Claude
+        if classified.is_unsafe_request:
             logger.warning(
                 "unsafe_request_refused",
-                extra={"request_id": request_id, "unsafe_reason": unsafe_label},
+                extra={"request_id": request_id},
             )
             payload = _build_refuse_payload()
-        elif is_vague_input(body.input_text):
+        elif classified.is_vague:
             logger.info("vague_input_uncertain", extra={"request_id": request_id})
             payload = _build_uncertain_payload()
         else:
@@ -553,7 +577,14 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             {
                 "conversation_id": body.conversation_id,
                 "role": "assistant",
-                "content": payload.model_dump(),
+                "content": {
+                    **payload.model_dump(),
+                    "_meta": {
+                        "prompt_version": PROMPT_VERSION,
+                        "model": "mock-v1",
+                        "is_mock": True,
+                    },
+                },
                 "user_id": user_id,
             },
             auth.jwt,
@@ -592,5 +623,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 "latency_ms": round((time.perf_counter() - start) * 1000),
                 "is_mock": settings.chat_mock_mode,
                 "prompt_version": PROMPT_VERSION,
+                # injection_flag_count is safe to log — it's a count, not content
+                "injection_flag_count": len(classified.injection_flags) if classified else 0,
             },
         )
