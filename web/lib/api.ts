@@ -223,6 +223,22 @@ export async function getMessages(conversationId: string): Promise<MessageOut[]>
   return apiFetch<MessageOut[]>(`/conversations/${conversationId}/messages`);
 }
 
+export type DocOut = {
+  id: string;
+  title: string;
+  filename: string;
+  storage_path: string;
+  file_hash: string;
+  version: string;
+  status: "pending" | "indexed" | "failed";
+  created_at: string;
+  updated_at: string;
+};
+
+export async function listDocs(): Promise<DocOut[]> {
+  return apiFetch<DocOut[]>("/docs");
+}
+
 export async function postChat(
   inputText: string,
   conversationId: string,

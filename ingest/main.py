@@ -1,4 +1,5 @@
 import asyncio
+import json as _json
 import logging
 import random
 import time
@@ -12,7 +13,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -166,7 +167,7 @@ async def _validate_token(token: str) -> dict:
         },
     )
     if response.status_code != 200:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+        raise AppError("UNAUTHORIZED", "Invalid or expired token.", status.HTTP_401_UNAUTHORIZED)
     return response.json()
 
 
@@ -271,6 +272,9 @@ async def _db_insert(table: str, row: dict, jwt: str) -> dict:
             headers={**_rls_headers(jwt), "Prefer": "return=representation"},
         )
     )
+    if response.status_code in (401, 403):
+        # RLS violation or permission denied — surface as 403 so callers get a usable error.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Permission denied: {table}")
     if response.status_code not in (200, 201):
         # Log the raw PostgREST body so the real cause is visible in server logs.
         # Common codes: 42501=RLS violation, 42P01=table not found, 23505=unique constraint.
@@ -397,6 +401,26 @@ class ChatResponse(BaseModel):
     request_id: str  # UUID v4 — use for logging and client-side deduplication
     assistant_payload: AssistantPayload
     response_metadata: ResponseMetadata
+
+
+class DocOut(BaseModel):
+    id: str
+    title: str
+    filename: str
+    storage_path: str
+    file_hash: str
+    version: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
+class CreateDocRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    filename: str = Field(..., min_length=1, max_length=200)
+    storage_path: str = Field(..., min_length=1, max_length=500)
+    file_hash: str = Field(..., min_length=64, max_length=64)  # SHA-256 hex
+    version: str = Field(default="1", max_length=20)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +556,26 @@ def _build_uncertain_payload() -> AssistantPayload:
         sources=[],
         flag="uncertain",
         disclaimer=_DISCLAIMER,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSE stream helper
+# ---------------------------------------------------------------------------
+
+
+async def _mock_sse_stream(payload: AssistantPayload, request_id: str):
+    """Yield SSE chunks: delta tokens from patient_facing_summary, then a done event.
+
+    In production (Week 2), replace with real LLM streaming tokens.
+    Each chunk is self-contained JSON so the client can parse incrementally.
+    """
+    summary = payload.patient_facing_summary or "Informacje przetworzone."
+    for word in summary.split():
+        yield f"data: {_json.dumps({'type': 'delta', 'token': word + ' '})}\n\n"
+        await asyncio.sleep(0.02)
+    yield (
+        f"data: {_json.dumps({'type': 'done', 'request_id': request_id, 'payload': payload.model_dump()})}\n\n"
     )
 
 
@@ -859,3 +903,191 @@ async def chat(
                 "injection_flag_count": len(classified.injection_flags) if classified else 0,
             },
         )
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    body: ChatRequest,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+    idempotency_key: str | None = Header(None, alias="idempotency-key"),  # noqa: B008
+) -> StreamingResponse:
+    """SSE variant of /chat.  Streams delta tokens then a 'done' event.
+
+    Persists ONE complete assistant message after payload is determined.
+    In Week 2: replace _build_raw_payload with a real LLM streaming call and
+    yield tokens as they arrive; store the message in a background task after
+    the stream closes.
+    """
+    request_id = str(uuid.uuid4())
+    user_id = auth.user_id
+
+    classified = classify_input(body.input_text)
+
+    if classified.pii_flags:
+        raise AppError(
+            "PII_DETECTED",
+            f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
+            "Please remove personal identifiers before submitting.",
+            status.HTTP_400_BAD_REQUEST,
+            request_id,
+        )
+    if classified.has_injection:
+        logger.warning(
+            "injection_detected",
+            extra={"request_id": request_id, "injection_flags": classified.injection_flags},
+        )
+    if not settings.chat_mock_mode:
+        raise AppError(
+            "MOCK_DISABLED",
+            "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
+            status.HTTP_501_NOT_IMPLEMENTED,
+            request_id,
+        )
+
+    conv_rows = await _db_select(
+        "/conversations",
+        {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
+        auth.jwt,
+    )
+    if not conv_rows:
+        raise AppError(
+            "CONVERSATION_NOT_FOUND",
+            "Conversation not found or access denied.",
+            status.HTTP_403_FORBIDDEN,
+            request_id,
+        )
+
+    # Idempotency: return cached stream if this key was already processed.
+    if idempotency_key:
+        cached_rows = await _db_select(
+            "/messages",
+            {
+                "conversation_id": f"eq.{body.conversation_id}",
+                "role": "eq.assistant",
+                "content->_meta->>idempotency_key": f"eq.{idempotency_key}",
+                "select": "id,content",
+            },
+            auth.jwt,
+        )
+        if cached_rows:
+            content = cached_rows[0]["content"]
+            cached_payload = AssistantPayload.model_validate(
+                {k: v for k, v in content.items() if k != "_meta"}
+            )
+            logger.info(
+                "idempotent_stream_replay",
+                extra={"request_id": request_id, "idempotency_key": idempotency_key},
+            )
+            return StreamingResponse(
+                _mock_sse_stream(cached_payload, request_id),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
+            )
+
+    # Build and validate payload (same logic as /chat).
+    raw_dict = _build_raw_payload(body.mode, classified)
+    try:
+        payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
+    except ValidationError as exc:
+        logger.error(
+            "payload_validation_failed",
+            extra={"request_id": request_id, "error_count": exc.error_count()},
+        )
+        raise AppError(
+            "VALIDATION_FAILED",
+            "Assistant response did not meet the required schema. Please retry.",
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            request_id,
+        ) from None
+
+    # Persist user message.
+    user_meta: dict[str, Any] = {
+        "input_hash": classified.input_hash,
+        "injection_flags": classified.injection_flags,
+        "is_vague": classified.is_vague,
+        "is_unsafe_request": classified.is_unsafe_request,
+        "prompt_version": PROMPT_VERSION,
+    }
+    if idempotency_key:
+        user_meta["idempotency_key"] = idempotency_key
+    await _db_insert(
+        "messages",
+        {
+            "conversation_id": body.conversation_id,
+            "role": "user",
+            "content": {"text": body.input_text, "mode": body.mode, "_meta": user_meta},
+            "user_id": user_id,
+        },
+        auth.jwt,
+    )
+
+    # Persist the complete assistant message before streaming begins.
+    # (In mock mode the payload is fully determined; Week 2 uses a background task.)
+    assistant_meta: dict[str, Any] = {
+        "prompt_version": PROMPT_VERSION,
+        "model": "mock-v1",
+        "is_mock": True,
+        "validation_status": "valid",
+        "repair_applied": repair_applied,
+    }
+    if idempotency_key:
+        assistant_meta["idempotency_key"] = idempotency_key
+    await _db_insert(
+        "messages",
+        {
+            "conversation_id": body.conversation_id,
+            "role": "assistant",
+            "content": {**payload.model_dump(), "_meta": assistant_meta},
+            "user_id": user_id,
+        },
+        auth.jwt,
+    )
+
+    return StreamingResponse(
+        _mock_sse_stream(payload, request_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Docs endpoints (Day 15 — document metadata, no embeddings yet)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/docs", response_model=list[DocOut])
+async def list_docs(auth: Auth = Depends(get_auth)):  # noqa: B008
+    """List all shared medical document metadata.  Any authenticated user can read."""
+    rows = await _db_select(
+        "/docs",
+        {
+            "order": "created_at.desc",
+            "select": "id,title,filename,storage_path,file_hash,version,status,created_at,updated_at",
+        },
+        auth.jwt,
+    )
+    return [DocOut(**r) for r in rows]
+
+
+@app.post("/docs", response_model=DocOut, status_code=status.HTTP_201_CREATED)
+async def create_doc(
+    body: CreateDocRequest,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    """Create a document metadata record.  Requires admin role (enforced by DB RLS).
+
+    The file must already be uploaded to Supabase Storage before calling this endpoint.
+    PostgREST returns 403 if the caller is not an admin — _db_insert surfaces this as HTTP 403.
+    """
+    row = await _db_insert(
+        "docs",
+        {
+            "title": body.title,
+            "filename": body.filename,
+            "storage_path": body.storage_path,
+            "file_hash": body.file_hash,
+            "version": body.version,
+        },
+        auth.jwt,
+    )
+    return DocOut(**row)
