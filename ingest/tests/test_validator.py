@@ -107,7 +107,10 @@ def test_repair_source_missing_fields_filled():
 
 def test_repair_non_dict_source_dropped():
     out = repair_payload(
-        {**REPAIRABLE_RAW, "sources": ["not-a-dict", 42, {"id": "ok", "title": "T", "section": "S"}]}
+        {
+            **REPAIRABLE_RAW,
+            "sources": ["not-a-dict", 42, {"id": "ok", "title": "T", "section": "S"}],
+        }
     )
     assert len(out["sources"]) == 1
     assert out["sources"][0]["id"] == "ok"
@@ -197,13 +200,16 @@ def test_chat_unrepairable_returns_500(client):
         resp = client.post("/chat", json=VALID_BODY)
 
     assert resp.status_code == 500
-    detail = resp.json()["detail"]
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_FAILED"
     # Generic safe message — no raw values
-    assert "schema" in detail.lower() or "retry" in detail.lower()
-    assert "42" not in detail
+    assert "schema" in error["message"].lower() or "retry" in error["message"].lower()
+    assert "42" not in error["message"]
 
     # Only user message was inserted; bad assistant payload must never be stored
-    assert len(mock_insert.call_args_list) == 1, "Assistant row must not be stored on validation failure"
+    assert len(mock_insert.call_args_list) == 1, (
+        "Assistant row must not be stored on validation failure"
+    )
 
 
 def test_chat_assistant_meta_has_flags_not_content(client):

@@ -25,6 +25,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly code?: string, // stable backend error code e.g. "PII_DETECTED"
   ) {
     super(message);
     this.name = "ApiError";
@@ -117,14 +118,44 @@ export async function apiFetch<T = unknown>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(
-      // FastAPI puts error detail in body.detail; fall back to status text
-      body?.detail ?? `${res.status} ${res.statusText}`,
-      res.status,
-    );
+    // New shape: {"error": {"code": "...", "message": "..."}}
+    // Legacy shape: {"detail": "..."}
+    const code: string | undefined = body?.error?.code;
+    const message: string =
+      body?.error?.message ?? body?.detail ?? `${res.status} ${res.statusText}`;
+    throw new ApiError(message, res.status, code);
   }
 
   return res.json() as Promise<T>;
+}
+
+// ---------------------------------------------------------------------------
+// Client-side retry
+//
+// Retries only transient failures (network unreachable, 429, 502, 503, 504).
+// Does NOT retry 4xx client errors — those require user action (e.g. PII warning).
+// Max 2 retries with a fixed 1 s delay (sufficient for brief network blips).
+// ---------------------------------------------------------------------------
+
+const _TRANSIENT_STATUSES = new Set([429, 502, 503, 504]);
+
+export async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (err instanceof ApiError) {
+        // Don't retry client errors or auth failures — they won't self-heal
+        if (!_TRANSIENT_STATUSES.has(err.status) && err.status !== 0) throw err;
+      }
+      if (attempt < maxRetries) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +227,11 @@ export async function postChat(
   inputText: string,
   conversationId: string,
   mode: ChatMode = "triage",
+  idempotencyKey?: string,
 ): Promise<ChatApiResponse> {
   return apiFetch<ChatApiResponse>("/chat", {
     method: "POST",
+    headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {},
     body: JSON.stringify({
       mode,
       input_text: inputText,

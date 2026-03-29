@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { createConversation, getMessages, postChat, type AssistantPayload, type ChatMode } from "@/lib/api";
+import { ApiError, createConversation, getMessages, postChat, withRetry, type AssistantPayload, type ChatMode } from "@/lib/api";
 
 type Message = {
   id: string;
@@ -15,6 +15,25 @@ function getUserText(content: unknown): string {
   if (content && typeof content === "object" && "text" in content)
     return String((content as { text: unknown }).text);
   return "";
+}
+
+// Maps stable backend error codes to user-friendly Polish messages.
+// Falls back to the raw error message for unknown codes.
+const ERROR_MESSAGES: Record<string, string> = {
+  PII_DETECTED:
+    "Wykryto dane identyfikacyjne pacjenta (np. e-mail, PESEL, telefon). Usuń je przed wysłaniem.",
+  MOCK_DISABLED: "Integracja z modelem AI nie jest jeszcze włączona. Skontaktuj się z administratorem.",
+  CONVERSATION_NOT_FOUND: "Nie znaleziono rozmowy. Odśwież stronę i spróbuj ponownie.",
+  VALIDATION_FAILED: "Odpowiedź asystenta nie spełnia wymagań schematu. Spróbuj ponownie.",
+  TIMEOUT: "Przekroczono czas oczekiwania na odpowiedź. Spróbuj ponownie.",
+  TRANSIENT_UPSTREAM: "Usługa chwilowo niedostępna. Spróbuj ponownie za chwilę.",
+};
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof ApiError && err.code && err.code in ERROR_MESSAGES) {
+    return ERROR_MESSAGES[err.code];
+  }
+  return err instanceof Error ? err.message : "Wysyłanie wiadomości nie powiodło się.";
 }
 
 const FLAG_STYLES: Record<AssistantPayload["flag"], string> = {
@@ -220,6 +239,10 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
     setError(null);
     setInput("");
 
+    // One idempotency key per send attempt — ensures exactly-once delivery even
+    // if the user retries or the client retries internally via withRetry.
+    const idempotencyKey = crypto.randomUUID();
+
     // Optimistic user bubble — shown immediately before any network calls.
     const optimisticUser: Message = {
       id: crypto.randomUUID(),
@@ -242,7 +265,9 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
         createdId = conv.id;
       }
 
-      const result = await postChat(text, convId, mode);
+      // withRetry handles transient network blips (status 0, 429, 502, 503, 504).
+      // The idempotency key makes retries safe — the backend deduplicates them.
+      const result = await withRetry(() => postChat(text, convId!, mode, idempotencyKey));
 
       // Replace the optimistic user bubble and append the assistant reply.
       const optimisticAssistant: Message = {
@@ -259,7 +284,7 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
     } catch (err) {
       // Roll back the optimistic message and restore the draft.
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUser.id));
-      setError(err instanceof Error ? err.message : "Send failed");
+      setError(getErrorMessage(err));
       setInput(text);
     } finally {
       setSending(false);

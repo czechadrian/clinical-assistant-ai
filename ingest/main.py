@@ -1,14 +1,18 @@
+import asyncio
 import logging
+import random
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -47,11 +51,14 @@ logger = logging.getLogger(__name__)
 _auth_client: httpx.AsyncClient
 _db_client: httpx.AsyncClient
 
+# Conservative timeouts: connect fast, allow up to 10 s for DB reads.
+_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _auth_client, _db_client
-    _auth_client = httpx.AsyncClient(base_url=settings.supabase_url)
+    _auth_client = httpx.AsyncClient(base_url=settings.supabase_url, timeout=_TIMEOUT)
     _db_client = httpx.AsyncClient(
         base_url=f"{settings.supabase_url}/rest/v1",
         headers={
@@ -61,6 +68,7 @@ async def lifespan(_: FastAPI):
             "apikey": settings.supabase_service_role_key,
             "Content-Type": "application/json",
         },
+        timeout=_TIMEOUT,
     )
     logger.info(
         "startup",
@@ -79,11 +87,62 @@ app.add_middleware(
     allow_origins=settings.allowed_origins,
     allow_origin_regex=settings.cors_origin_regex,
     allow_methods=["GET", "POST"],  # only what this API actually exposes
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
     allow_credentials=False,  # Bearer tokens, not cookies
 )
 
 bearer_scheme = HTTPBearer()
+
+
+# ---------------------------------------------------------------------------
+# Error taxonomy
+#
+# AppError provides stable, machine-readable error codes so the frontend can
+# react specifically (e.g. show a PII-specific warning vs. a generic retry).
+#
+# Response shape:
+#   {"error": {"code": "PII_DETECTED", "message": "...", "request_id": "..."}}
+#
+# Stable codes (never rename these — clients key off them):
+#   PII_DETECTED          400  — personal identifiers in input
+#   MOCK_DISABLED         501  — LLM integration not enabled
+#   CONVERSATION_NOT_FOUND 403 — conv missing or belongs to another user
+#   VALIDATION_FAILED     500  — assistant payload failed schema validation
+#   TIMEOUT               504  — upstream request exceeded timeout
+#   TRANSIENT_UPSTREAM    502  — upstream unavailable after retries
+#   DUPLICATE_REQUEST     200  — idempotent replay (not an error; see /chat)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AppError(Exception):
+    """Typed application error with a stable machine-readable code.
+
+    Raised instead of HTTPException for domain errors in /chat.
+    _app_error_handler converts it to a JSON response.
+    """
+
+    code: str  # stable identifier e.g. "PII_DETECTED"
+    message: str  # human-readable, safe to expose to the client
+    http_status: int  # HTTP status code
+    request_id: str | None = None  # set by the /chat handler
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
+
+
+@app.exception_handler(AppError)
+async def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "request_id": exc.request_id,
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +186,70 @@ async def get_supabase_user(
 
 
 # ---------------------------------------------------------------------------
+# Retry
+#
+# Wraps a single httpx request with up to _MAX_RETRIES retries.
+# Only transient failures are retried: 429/502/503/504 and network errors.
+# Client errors (4xx) and server errors with a stable cause (e.g. 403/422)
+# are returned immediately so the caller can surface the real error.
+#
+# Backoff: full jitter — sleep(random(0, min(cap, base * 2^attempt))).
+# This avoids thundering-herd while keeping retries fast on average.
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
+_MAX_RETRIES = 2
+
+
+def _backoff(attempt: int) -> float:
+    """Full-jitter exponential backoff in seconds."""
+    base, cap = 0.5, 4.0
+    return random.uniform(0, min(cap, base * (2**attempt)))
+
+
+async def _retrying_request(factory: Callable[[], Any]) -> httpx.Response:
+    """
+    Call ``factory()`` (which must return an awaitable httpx.Response) and retry
+    on transient failures up to ``_MAX_RETRIES`` times.
+
+    Raises AppError on timeout or network exhaustion.
+    Non-transient responses (including 4xx) are returned as-is.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp: httpx.Response = await factory()
+            if resp.status_code in _TRANSIENT_STATUSES and attempt < _MAX_RETRIES:
+                await asyncio.sleep(_backoff(attempt))
+                continue
+            return resp
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            if attempt >= _MAX_RETRIES:
+                raise AppError(
+                    "TIMEOUT",
+                    "The request timed out. Please retry.",
+                    status.HTTP_504_GATEWAY_TIMEOUT,
+                ) from exc
+            await asyncio.sleep(_backoff(attempt))
+        except httpx.NetworkError as exc:
+            last_exc = exc
+            if attempt >= _MAX_RETRIES:
+                raise AppError(
+                    "TRANSIENT_UPSTREAM",
+                    "Upstream service unavailable. Please retry.",
+                    status.HTTP_502_BAD_GATEWAY,
+                ) from exc
+            await asyncio.sleep(_backoff(attempt))
+    # Reached only if all retries ended with a transient status (not exception).
+    raise AppError(
+        "TRANSIENT_UPSTREAM",
+        "Upstream service unavailable after retries. Please retry.",
+        status.HTTP_502_BAD_GATEWAY,
+    ) from last_exc
+
+
+# ---------------------------------------------------------------------------
 # Supabase REST helpers
 #
 # Both helpers accept the caller's JWT and inject it as Authorization.
@@ -141,10 +264,12 @@ def _rls_headers(jwt: str) -> dict[str, str]:
 
 async def _db_insert(table: str, row: dict, jwt: str) -> dict:
     """Insert one row and return it. RLS applies via the caller's JWT."""
-    response = await _db_client.post(
-        f"/{table}",
-        json=row,
-        headers={**_rls_headers(jwt), "Prefer": "return=representation"},
+    response = await _retrying_request(
+        lambda: _db_client.post(
+            f"/{table}",
+            json=row,
+            headers={**_rls_headers(jwt), "Prefer": "return=representation"},
+        )
     )
     if response.status_code not in (200, 201):
         # Log the raw PostgREST body so the real cause is visible in server logs.
@@ -166,7 +291,9 @@ async def _db_insert(table: str, row: dict, jwt: str) -> dict:
 
 async def _db_select(path: str, params: dict, jwt: str) -> list[dict]:
     """Run a GET query against PostgREST. RLS applies via the caller's JWT."""
-    response = await _db_client.get(path, params=params, headers=_rls_headers(jwt))
+    response = await _retrying_request(
+        lambda: _db_client.get(path, params=params, headers=_rls_headers(jwt))
+    )
     if not response.is_success:
         logger.error(
             "db_select_failed",
@@ -486,7 +613,11 @@ async def get_messages(
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
+async def chat(
+    body: ChatRequest,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+    idempotency_key: str | None = Header(None, alias="idempotency-key"),  # noqa: B008
+):
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
     user_id = auth.user_id
@@ -517,10 +648,12 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 "pii_rejected",
                 extra={"request_id": request_id, "pii_type": classified.pii_flags[0]},
             )
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
+            raise AppError(
+                "PII_DETECTED",
                 f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
                 "Please remove personal identifiers before submitting.",
+                status.HTTP_400_BAD_REQUEST,
+                request_id,
             )
 
         # 0b. Injection detected — log and continue (non-blocking) ----------
@@ -535,9 +668,11 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
 
         # 0.5 Feature flag ---------------------------------------------------
         if not settings.chat_mock_mode:
-            raise HTTPException(
-                status.HTTP_501_NOT_IMPLEMENTED,
+            raise AppError(
+                "MOCK_DISABLED",
                 "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
+                status.HTTP_501_NOT_IMPLEMENTED,
+                request_id,
             )
 
         # 1. Verify conversation ownership -----------------------------------
@@ -547,13 +682,60 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             auth.jwt,
         )
         if not conv_rows:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN, "Conversation not found or access denied"
+            raise AppError(
+                "CONVERSATION_NOT_FOUND",
+                "Conversation not found or access denied.",
+                status.HTTP_403_FORBIDDEN,
+                request_id,
             )
+
+        # 1a. Idempotency check — before any writes --------------------------
+        # If the client sent a key we've already processed, return the cached
+        # assistant response without inserting any new rows.
+        if idempotency_key:
+            cached_rows = await _db_select(
+                "/messages",
+                {
+                    "conversation_id": f"eq.{body.conversation_id}",
+                    "role": "eq.assistant",
+                    "content->_meta->>idempotency_key": f"eq.{idempotency_key}",
+                    "select": "id,content",
+                },
+                auth.jwt,
+            )
+            if cached_rows:
+                content = cached_rows[0]["content"]
+                meta = content.get("_meta", {})
+                cached_payload = AssistantPayload.model_validate(
+                    {k: v for k, v in content.items() if k != "_meta"}
+                )
+                logger.info(
+                    "idempotent_replay",
+                    extra={"request_id": request_id, "idempotency_key": idempotency_key},
+                )
+                return ChatResponse(
+                    request_id=request_id,
+                    assistant_payload=cached_payload,
+                    response_metadata=ResponseMetadata(
+                        is_mock=meta.get("is_mock", True),
+                        model=meta.get("model", "mock-v1"),
+                        prompt_version=meta.get("prompt_version", PROMPT_VERSION),
+                    ),
+                )
 
         # 2. Insert user message — include classification metadata -----------
         # _meta stores flag labels and a content-hash for audit.
         # It never stores raw flagged substrings or patient text.
+        user_meta: dict[str, Any] = {
+            "input_hash": classified.input_hash,
+            "injection_flags": classified.injection_flags,
+            "is_vague": classified.is_vague,
+            "is_unsafe_request": classified.is_unsafe_request,
+            "prompt_version": PROMPT_VERSION,
+        }
+        if idempotency_key:
+            user_meta["idempotency_key"] = idempotency_key
+
         await _db_insert(
             "messages",
             {
@@ -562,13 +744,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 "content": {
                     "text": body.input_text,
                     "mode": body.mode,
-                    "_meta": {
-                        "input_hash": classified.input_hash,
-                        "injection_flags": classified.injection_flags,
-                        "is_vague": classified.is_vague,
-                        "is_unsafe_request": classified.is_unsafe_request,
-                        "prompt_version": PROMPT_VERSION,
-                    },
+                    "_meta": user_meta,
                 },
                 "user_id": user_id,
             },
@@ -603,17 +779,31 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
             if settings.validation_debug:
                 # Field paths + error types only — never the raw invalid values.
                 error_locs = [
-                    f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}"
-                    for e in exc.errors()
+                    f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}" for e in exc.errors()
                 ]
                 safe_detail = f"{safe_detail} [debug] Invalid fields: {error_locs}"
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, safe_detail) from None
+            raise AppError(
+                "VALIDATION_FAILED",
+                safe_detail,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                request_id,
+            ) from None
 
         if repair_applied:
             logger.warning("payload_repaired", extra={"request_id": request_id})
 
         # 5. Insert assistant message — validation must pass before storage ---
         # Raw invalid output is never stored; only the repaired-and-validated payload.
+        assistant_meta: dict[str, Any] = {
+            "prompt_version": PROMPT_VERSION,
+            "model": "mock-v1",
+            "is_mock": True,
+            "validation_status": "valid",
+            "repair_applied": repair_applied,
+        }
+        if idempotency_key:
+            assistant_meta["idempotency_key"] = idempotency_key
+
         await _db_insert(
             "messages",
             {
@@ -621,13 +811,7 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 "role": "assistant",
                 "content": {
                     **payload.model_dump(),
-                    "_meta": {
-                        "prompt_version": PROMPT_VERSION,
-                        "model": "mock-v1",
-                        "is_mock": True,
-                        "validation_status": "valid",
-                        "repair_applied": repair_applied,
-                    },
+                    "_meta": assistant_meta,
                 },
                 "user_id": user_id,
             },
@@ -643,6 +827,10 @@ async def chat(body: ChatRequest, auth: Auth = Depends(get_auth)):  # noqa: B008
                 prompt_version=PROMPT_VERSION,
             ),
         )
+
+    except AppError as exc:
+        status_code = exc.http_status
+        raise  # _app_error_handler converts to JSONResponse
 
     except HTTPException as exc:
         status_code = exc.status_code

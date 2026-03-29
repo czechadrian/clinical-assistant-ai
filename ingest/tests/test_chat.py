@@ -77,8 +77,9 @@ def test_chat_400_pii_detected(client):
         json={**VALID_BODY, "input_text": "Contact patient at jan.kowalski@example.com"},
     )
     assert resp.status_code == 400
-    detail = resp.json()["detail"].lower()
-    assert "identifying" in detail or "pii" in detail
+    error = resp.json()["error"]
+    assert error["code"] == "PII_DETECTED"
+    assert "request_id" in error
 
 
 def test_chat_501_mock_disabled(client, monkeypatch):
@@ -86,7 +87,9 @@ def test_chat_501_mock_disabled(client, monkeypatch):
     monkeypatch.setattr(main.settings, "chat_mock_mode", False)
     resp = client.post("/chat", json=VALID_BODY)
     assert resp.status_code == 501
-    assert "CHAT_MOCK_MODE" in resp.json()["detail"]
+    error = resp.json()["error"]
+    assert error["code"] == "MOCK_DISABLED"
+    assert "request_id" in error
 
 
 def test_chat_200_refuse_unsafe(client):
