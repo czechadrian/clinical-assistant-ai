@@ -111,6 +111,8 @@ class Settings:
     supabase_url: str
     supabase_service_role_key: str
     anthropic_api_key: str
+    openai_api_key: str
+    embed_model: str  # embedding model identifier; must match vector(1536) column
     allowed_origins: list[str]
     cors_origin_regex: str | None
     app_env: str
@@ -140,6 +142,8 @@ class Settings:
             supabase_url=os.environ["SUPABASE_URL"],
             supabase_service_role_key=os.environ["SUPABASE_SERVICE_ROLE_KEY"],
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            embed_model=os.getenv("EMBED_MODEL", "text-embedding-3-small"),
             allowed_origins=allowed_origins,
             cors_origin_regex=cors_origin_regex,
             app_env=os.getenv("APP_ENV", "local"),

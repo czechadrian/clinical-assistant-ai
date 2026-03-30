@@ -14,8 +14,10 @@ This document defines the interface between the document metadata layer (Day 15)
 | `GET /docs` API endpoint | ✅ Created |
 | `POST /docs` API endpoint | ✅ Created |
 | Chunking / embedding | ❌ Not yet |
-| Vector store integration | ❌ Not yet |
-| RAG retrieval in `/chat` | ❌ Not yet |
+| `doc_chunks` table + pgvector | ✅ Created (Day 16) |
+| Vector store integration | ❌ Not yet (Day 18) |
+| `GET /retrieve` contract | ✅ Endpoint exists, returns `[]` until Day 18 |
+| RAG retrieval in `/chat` | ❌ Not yet (Day 18) |
 
 ---
 
@@ -77,15 +79,18 @@ If a row is returned, skip and mark the new upload as a duplicate (or DELETE it 
 When the chunking table is added, it will reference `docs.id`:
 
 ```sql
--- Future table (NOT yet created)
+-- Created in supabase/chunks_schema.sql (Day 16)
 CREATE TABLE doc_chunks (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     doc_id      uuid NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
     chunk_index int  NOT NULL,
     content     text NOT NULL,          -- raw chunk text (not stored in logs)
-    embedding   vector(1536),           -- pgvector extension
+    section     text,                   -- chapter/heading label, if extractable
+    page        int,                    -- source page number, if available
     token_count int,
-    created_at  timestamptz NOT NULL DEFAULT now()
+    embedding   vector(1536),           -- NULL until ingest worker populates
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (doc_id, chunk_index)
 );
 ```
 

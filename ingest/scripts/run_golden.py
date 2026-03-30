@@ -55,6 +55,7 @@ app.dependency_overrides[get_auth] = lambda: Auth(user_id="golden-runner", jwt="
 
 # ── Case runner ───────────────────────────────────────────────────────────────
 
+
 def _run_case(client: TestClient, case: dict, verbose: bool) -> bool:
     """Return True on pass, False on fail.  Never prints raw content."""
     expect = case["expect"]
@@ -106,8 +107,8 @@ def _run_case(client: TestClient, case: dict, verbose: bool) -> bool:
                 failures.append(f"questions_to_ask count {n} < {expect['min_questions']}")
 
         if "injection_flagged" in expect and mock_insert.call_count > 0:
-            flags = mock_insert.call_args_list[0].args[1]["content"]["_meta"].get(
-                "injection_flags", []
+            flags = (
+                mock_insert.call_args_list[0].args[1]["content"]["_meta"].get("injection_flags", [])
             )
             if expect["injection_flagged"] and not flags:
                 failures.append("expected injection_flags but got []")
@@ -136,6 +137,7 @@ def _report(name: str, failures: list[str], verbose: bool) -> bool:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     verbose = "--verbose" in sys.argv or "-v" in sys.argv
 
@@ -144,7 +146,7 @@ def main() -> None:
         sys.exit(1)
 
     cases = json.loads(_CASES_FILE.read_text())["cases"]
-    print(f"\nKliniczny Asystent AI — Golden Set Runner")
+    print("\nKliniczny Asystent AI — Golden Set Runner")
     print(f"Running {len(cases)} cases...\n")
 
     passed = failed = 0

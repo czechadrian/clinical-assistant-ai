@@ -18,6 +18,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from classifier import ClassifiedInput, classify_input  # noqa: F401
+from embedder import OpenAIEmbedder
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from settings import Settings, configure_logging
 from validator import validate_and_repair
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 _auth_client: httpx.AsyncClient
 _db_client: httpx.AsyncClient
+_embedder: OpenAIEmbedder | None = None  # None when OPENAI_API_KEY is not set
 
 # Conservative timeouts: connect fast, allow up to 10 s for DB reads.
 _TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
@@ -58,7 +60,7 @@ _TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _auth_client, _db_client
+    global _auth_client, _db_client, _embedder
     _auth_client = httpx.AsyncClient(base_url=settings.supabase_url, timeout=_TIMEOUT)
     _db_client = httpx.AsyncClient(
         base_url=f"{settings.supabase_url}/rest/v1",
@@ -71,13 +73,26 @@ async def lifespan(_: FastAPI):
         },
         timeout=_TIMEOUT,
     )
+    # Embedder is optional: only initialised when OPENAI_API_KEY is configured.
+    # /retrieve returns 503 and /chat skips context if _embedder is None.
+    _embedder = (
+        OpenAIEmbedder(settings.openai_api_key, settings.embed_model)
+        if settings.openai_api_key
+        else None
+    )
     logger.info(
         "startup",
-        extra={"app_env": settings.app_env, "git_commit": settings.git_commit},
+        extra={
+            "app_env": settings.app_env,
+            "git_commit": settings.git_commit,
+            "embedder_ready": _embedder is not None,
+        },
     )
     yield
     await _auth_client.aclose()
     await _db_client.aclose()
+    if _embedder is not None:
+        await _embedder.aclose()
     logger.info("shutdown")
 
 
@@ -314,6 +329,90 @@ async def _db_select(path: str, params: dict, jwt: str) -> list[dict]:
     return response.json()
 
 
+async def _db_rpc(function_name: str, params: dict, jwt: str) -> list[dict]:
+    """Call a PostgREST RPC function.  RLS applies via the caller's JWT.
+
+    The function is called at: POST /rest/v1/rpc/{function_name}
+    params is serialised as the JSON request body.
+    """
+    response = await _retrying_request(
+        lambda: _db_client.post(
+            f"/rpc/{function_name}",
+            json=params,
+            headers=_rls_headers(jwt),
+        )
+    )
+    if not response.is_success:
+        logger.error(
+            "db_rpc_failed",
+            extra={
+                "function": function_name,
+                "http_status": response.status_code,
+                "postgrest_error": response.text,
+            },
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"DB RPC failed: {function_name} (HTTP {response.status_code}) — check server logs",
+        )
+    return response.json()
+
+
+async def _retrieve_context(query: str, top_k: int, jwt: str) -> list[dict]:
+    """Return the top-k closest doc_chunks for *query*.
+
+    Returns [] silently on any failure (embedder not configured, API error,
+    DB error) so callers can degrade gracefully.  This is intentional for
+    /chat: retrieval failure must never block the assistant response.
+
+    Each returned dict contains: chunk_id, doc_id, title, section, content, score.
+    The 'content' field (full chunk text) must never be logged.
+    """
+    if _embedder is None:
+        return []
+    try:
+        embeddings = await _embedder.embed([query])
+        if not embeddings:
+            return []
+        rows = await _db_rpc(
+            "match_chunks",
+            {"query_embedding": embeddings[0], "match_count": top_k},
+            jwt,
+        )
+        return rows
+    except Exception as exc:
+        # Log type only — the query text is patient input and must not be logged.
+        logger.warning(
+            "retrieval_skipped",
+            extra={"reason": type(exc).__name__},
+        )
+        return []
+
+
+def _format_rag_context(rows: list[dict]) -> str:
+    """Wrap retrieved chunks in structured XML-like tags for LLM injection.
+
+    Injection resistance: retrieved text is isolated inside <retrieved_context>
+    so the model treats it as source material only, not executable instructions.
+    SYSTEM_PROMPT (policy.py) must instruct the model to honour this boundary.
+
+    Week 3 integration point: pass the return value of this function as
+    additional context inside the anthropic.messages.create() call, e.g.:
+        messages=[{"role": "user", "content": classified.for_llm() + context_block}]
+
+    Privacy: the return value contains full chunk text — never log it.
+    """
+    if not rows:
+        return ""
+    parts: list[str] = []
+    for r in rows:
+        label = f"doc_id='{r['doc_id']}' title='{r['title']}'"
+        if r.get("section"):
+            label += f" section='{r['section']}'"
+        parts.append(f"<source {label}>\n{r['content']}\n</source>")
+    return "<retrieved_context>\n" + "\n\n".join(parts) + "\n</retrieved_context>"
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -421,6 +520,33 @@ class CreateDocRequest(BaseModel):
     storage_path: str = Field(..., min_length=1, max_length=500)
     file_hash: str = Field(..., min_length=64, max_length=64)  # SHA-256 hex
     version: str = Field(default="1", max_length=20)
+
+
+class RetrievedChunk(BaseModel):
+    """One item in a /retrieve response.
+
+    text_snippet is the first 300 characters of the chunk content — enough
+    for display purposes.  The /chat endpoint uses full content internally
+    via _retrieve_context(), never via this model.
+    """
+
+    chunk_id: str
+    doc_id: str
+    title: str  # from docs.title
+    section: str | None
+    score: float  # cosine similarity in [0, 1]; higher = more relevant
+    text_snippet: str  # first 300 chars of doc_chunks.content
+
+
+class RetrieveResponse(BaseModel):
+    """Contract for GET /retrieve.
+
+    top_k echoes the requested limit so callers can tell whether fewer
+    results were returned because the index is sparse (items < top_k).
+    """
+
+    items: list[RetrievedChunk]
+    top_k: int
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +794,7 @@ async def chat(
     input_length = len(body.input_text)
     status_code = 200
     classified: ClassifiedInput | None = None  # set in try block; read safely in finally
+    retrieved: list[dict] = []  # set in try block; count logged in finally
 
     # Logged on arrival — never includes raw content.
     logger.info(
@@ -795,6 +922,15 @@ async def chat(
             auth.jwt,
         )
 
+        # 2a. Retrieve context — non-blocking, degrades to [] on any failure ---
+        # Retrieved chunks are used to populate sources[] in the response.
+        # In mock mode the content is not forwarded to an LLM, but _format_rag_context
+        # is ready for Week 3 — see its docstring for the integration point.
+        # Privacy: retrieved content is never logged (only the count is safe).
+        retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
+        # Week 3: uncomment and pass _rag_context to anthropic.messages.create.
+        # _rag_context = _format_rag_context(retrieved)
+
         # 3. Build raw payload dict -------------------------------------------
         # Log the routing decision before building; _build_raw_payload is pure.
         if classified.is_unsafe_request:
@@ -803,6 +939,18 @@ async def chat(
             logger.info("vague_input_uncertain", extra={"request_id": request_id})
 
         raw_dict = _build_raw_payload(body.mode, classified)
+
+        # 3a. Inject sources from retrieved chunks (even in mock mode) ---------
+        # sources[] references doc_id + title only — never chunk content.
+        if retrieved:
+            raw_dict["sources"] = [
+                {
+                    "id": str(r["doc_id"]),
+                    "title": r["title"],
+                    "section": r.get("section") or "",
+                }
+                for r in retrieved
+            ]
 
         # 4. Validate — repair once if needed — validate again ----------------
         # On success: payload is a valid AssistantPayload; repair_applied records whether
@@ -899,8 +1047,9 @@ async def chat(
                 "latency_ms": round((time.perf_counter() - start) * 1000),
                 "is_mock": settings.chat_mock_mode,
                 "prompt_version": PROMPT_VERSION,
-                # injection_flag_count is safe to log — it's a count, not content
+                # counts only — never raw content
                 "injection_flag_count": len(classified.injection_flags) if classified else 0,
+                "retrieved_count": len(retrieved),
             },
         )
 
@@ -1091,3 +1240,59 @@ async def create_doc(
         auth.jwt,
     )
     return DocOut(**row)
+
+
+# ---------------------------------------------------------------------------
+# Retrieval endpoint (Day 16 — contract only; vector search added Day 18)
+# ---------------------------------------------------------------------------
+
+_SNIPPET_LEN = 300  # characters shown in text_snippet; tune when real chunks exist
+
+
+@app.get("/retrieve", response_model=RetrieveResponse)
+async def retrieve(
+    query: str = "",
+    top_k: int = 5,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    """Semantic chunk retrieval for RAG.
+
+    Embeds the query, runs a pgvector cosine-similarity search via the
+    match_chunks Postgres function, and returns the top_k nearest chunks.
+
+    Returns an empty list for blank queries without hitting the embedding API.
+    Returns 503 if OPENAI_API_KEY is not configured.
+
+    Auth required: chunk content is clinical knowledge — not public.
+    """
+    if not 1 <= top_k <= 20:
+        raise AppError(
+            "VALIDATION_FAILED",
+            "top_k must be between 1 and 20.",
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+    if not query.strip():
+        return RetrieveResponse(items=[], top_k=top_k)
+
+    if _embedder is None:
+        raise AppError(
+            "CONFIGURATION_ERROR",
+            "Embedding provider is not configured. Set OPENAI_API_KEY in the environment.",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    rows = await _retrieve_context(query, top_k, auth.jwt)
+    items = [
+        RetrievedChunk(
+            chunk_id=str(r["chunk_id"]),
+            doc_id=str(r["doc_id"]),
+            title=r["title"],
+            section=r.get("section"),
+            score=float(r["score"]),
+            # text_snippet is a display excerpt; full content stays server-side.
+            text_snippet=r["content"][:_SNIPPET_LEN],
+        )
+        for r in rows
+    ]
+    return RetrieveResponse(items=items, top_k=top_k)

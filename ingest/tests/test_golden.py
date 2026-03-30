@@ -112,13 +112,9 @@ def test_golden_case(client, case):
             user_meta = mock_insert.call_args_list[0].args[1]["content"]["_meta"]
             flags = user_meta.get("injection_flags", [])
             if expect["injection_flagged"]:
-                assert len(flags) > 0, (
-                    f"[{case['name']}] expected injection_flags but got []"
-                )
+                assert len(flags) > 0, f"[{case['name']}] expected injection_flags but got []"
             else:
-                assert flags == [], (
-                    f"[{case['name']}] expected no injection_flags but got {flags}"
-                )
+                assert flags == [], f"[{case['name']}] expected no injection_flags but got {flags}"
 
     else:
         data = resp.json()
