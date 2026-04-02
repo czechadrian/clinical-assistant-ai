@@ -13,6 +13,7 @@ Six cases:
 from unittest.mock import AsyncMock, patch
 
 import main
+from main import AssistantPayload, Source, _check_groundedness, _has_guideline_language
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,3 +129,118 @@ def test_chat_200_uncertain_vague(client):
     payload = resp.json()["assistant_payload"]
     assert payload["flag"] == "uncertain"
     assert len(payload["questions_to_ask"]) >= 3
+
+
+# ---------------------------------------------------------------------------
+# RAG grounding
+# ---------------------------------------------------------------------------
+
+
+def test_chat_no_retrieval_forces_uncertain(client):
+    """Non-vague, non-unsafe query with no retrieved chunks → no-source uncertain payload."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+        # _embedder is None in tests → _retrieve_context returns [] automatically
+    ):
+        resp = client.post("/chat", json=VALID_BODY)
+
+    assert resp.status_code == 200
+    payload = resp.json()["assistant_payload"]
+    assert payload["flag"] == "uncertain"
+    assert payload["sources"] == []
+
+
+@patch("main._embedder")
+@patch("main._db_rpc", new_callable=AsyncMock)
+def test_chat_retrieval_populates_sources(mock_rpc, mock_embedder, client):
+    """When retrieval returns high-confidence chunks, sources[] is populated with chunk_id."""
+    mock_embedder.embed = AsyncMock(return_value=[[0.1] * 1536])
+    mock_rpc.return_value = [
+        {
+            "chunk_id": "aaaaaaaa-0000-0000-0000-000000000001",
+            "doc_id": "bbbbbbbb-0000-0000-0000-000000000001",
+            "title": "PTK Guidelines 2024",
+            "section": "OZW",
+            "content": "Postepowanie w OZW bez uniesienia ST." * 20,
+            "score": 0.91,
+        }
+    ]
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=VALID_BODY)
+
+    assert resp.status_code == 200
+    sources = resp.json()["assistant_payload"]["sources"]
+    assert len(sources) == 1
+    assert sources[0]["id"] == "aaaaaaaa-0000-0000-0000-000000000001"
+    assert sources[0]["title"] == "PTK Guidelines 2024"
+    assert sources[0]["section"] == "OZW"
+    assert sources[0]["text_snippet"] is not None
+    assert len(sources[0]["text_snippet"]) <= 300
+
+
+# ---------------------------------------------------------------------------
+# Groundedness helpers — unit tests (no FastAPI)
+# ---------------------------------------------------------------------------
+
+
+def test_has_guideline_language_detects_dosage():
+    assert _has_guideline_language("Zaleca się podanie 10mg aspiryny doustnie.")
+
+
+def test_has_guideline_language_detects_org_ref():
+    assert _has_guideline_language("Zgodnie z wytycznymi ESC z 2023 rokiem...")
+
+
+def test_has_guideline_language_clean_text():
+    assert not _has_guideline_language("Pacjent zgłasza ból głowy od trzech dni.")
+
+
+def test_check_groundedness_downgrades_confident_no_source():
+    """Confident guideline language without sources → downgraded to uncertain."""
+    payload = AssistantPayload(
+        questions_to_ask=[],
+        red_flags=[],
+        possible_next_steps=["Zgodnie z wytycznymi PTK 2024 należy podać 10mg X."],
+        patient_facing_summary="Zalecenia PTK wskazują na zastosowanie leczenia Y.",
+        sources=[],
+        flag="safe",
+        disclaimer="disclaimer",
+    )
+    result = _check_groundedness(payload, high_confidence=[])
+    assert result.flag == "uncertain"
+    assert result.sources == []
+
+
+def test_check_groundedness_passes_with_sources():
+    """Sources present → no downgrade even with guideline language."""
+    src = Source(id="c1", title="PTK 2024", section="OZW")
+    payload = AssistantPayload(
+        questions_to_ask=[],
+        red_flags=[],
+        possible_next_steps=["Zgodnie z wytycznymi PTK 2024 należy podać 10mg X."],
+        patient_facing_summary="...",
+        sources=[src],
+        flag="safe",
+        disclaimer="disclaimer",
+    )
+    result = _check_groundedness(payload, high_confidence=[{"chunk_id": "c1"}])
+    assert result.flag == "safe"
+
+
+def test_check_groundedness_skips_refuse():
+    """Refuse payloads are never touched by the groundedness check."""
+    payload = AssistantPayload(
+        questions_to_ask=[],
+        red_flags=[],
+        possible_next_steps=[],
+        patient_facing_summary="",
+        sources=[],
+        flag="refuse",
+        disclaimer="disclaimer",
+    )
+    result = _check_groundedness(payload, high_confidence=[])
+    assert result.flag == "refuse"

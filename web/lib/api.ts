@@ -179,9 +179,10 @@ export type ConversationOut = {
 };
 
 export type Source = {
-  id: string;
+  id: string;        // chunk_id — traces to exact indexed chunk
   title: string;
   section: string;
+  text_snippet?: string; // first 300 chars of chunk content; populated server-side for debug toggle
 };
 
 export type AssistantPayload = {

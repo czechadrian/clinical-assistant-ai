@@ -90,6 +90,7 @@ def repair_payload(data: dict[str, Any]) -> dict[str, Any]:
                         "id": str(item.get("id", "")),
                         "title": str(item.get("title", "")),
                         "section": str(item.get("section", "")),
+                        "text_snippet": item.get("text_snippet"),  # None if absent — matches Source default
                     }
                 )
             # Non-dict items (strings, ints) are dropped — cannot be coerced to Source.

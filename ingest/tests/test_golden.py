@@ -107,6 +107,16 @@ def test_golden_case(client, case):
                 f"[{case['name']}] questions_to_ask count {n} < {expect['min_questions']}"
             )
 
+        if "sources_empty" in expect and expect["sources_empty"]:
+            assert payload.get("sources") == [], (
+                f"[{case['name']}] expected sources=[] but got {payload.get('sources')}"
+            )
+
+        if "sources_not_empty" in expect and expect["sources_not_empty"]:
+            assert len(payload.get("sources", [])) > 0, (
+                f"[{case['name']}] expected non-empty sources"
+            )
+
         # injection_flagged: check stored user message _meta (only when DB was written)
         if "injection_flagged" in expect and mock_insert.call_count > 0:
             user_meta = mock_insert.call_args_list[0].args[1]["content"]["_meta"]

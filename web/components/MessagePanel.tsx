@@ -48,7 +48,12 @@ const FLAG_LABELS: Record<AssistantPayload["flag"], string> = {
   refuse: "poza zakresem",
 };
 
+// Shown only outside production — lets developers verify which chunks drove the response.
+const IS_DEV = process.env.NODE_ENV !== "production";
+
 function AssistantBubble({ content }: { content: unknown }) {
+  const [showContext, setShowContext] = useState(false);
+
   let payload: AssistantPayload | null = null;
   if (typeof content === "string") {
     // Legacy TEXT rows that haven't been migrated yet
@@ -135,15 +140,34 @@ function AssistantBubble({ content }: { content: unknown }) {
       {/* Sources */}
       {payload.sources.length > 0 && (
         <div>
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-            Sources
-          </p>
-          <ul className="space-y-0.5">
-            {payload.sources.map((src) => (
-              <li key={src.id} className="text-xs text-zinc-500 dark:text-zinc-400">
-                <span className="font-medium">{src.id}</span> — {src.title}
+          <div className="mb-1 flex items-center justify-between">
+            <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+              Sources
+            </p>
+            {IS_DEV && payload.sources.some((s) => s.text_snippet) && (
+              <button
+                type="button"
+                onClick={() => setShowContext((v) => !v)}
+                className="text-xs text-zinc-400 underline-offset-2 hover:text-zinc-600 hover:underline dark:hover:text-zinc-300"
+              >
+                {showContext ? "Hide context" : "Show context"}
+              </button>
+            )}
+          </div>
+          <ul className="space-y-1.5">
+            {payload.sources.map((src, i) => (
+              <li key={src.id} className="text-xs">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">{src.title}</span>
                 {src.section && (
-                  <span className="text-zinc-400"> · {src.section}</span>
+                  <span className="text-zinc-500 dark:text-zinc-400"> · {src.section}</span>
+                )}
+                <span className="ml-1.5 font-mono text-zinc-400 dark:text-zinc-600">
+                  [{i + 1}]
+                </span>
+                {showContext && src.text_snippet && (
+                  <p className="mt-0.5 rounded border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
+                    {src.text_snippet}
+                  </p>
                 )}
               </li>
             ))}

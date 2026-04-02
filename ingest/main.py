@@ -2,6 +2,7 @@ import asyncio
 import json as _json
 import logging
 import random
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -436,11 +437,18 @@ class ChatRequest(BaseModel):
 
 
 class Source(BaseModel):
-    """A guideline or reference cited in the response."""
+    """A guideline or reference cited in the response.
+
+    id          — chunk_id, traces to the exact indexed chunk in doc_chunks.
+    text_snippet— first _SNIPPET_LEN chars of chunk content; populated server-side
+                  for the debug toggle in the UI.  Never logged.  Optional so
+                  stored messages (which predate this field) still deserialise.
+    """
 
     id: str
     title: str
     section: str
+    text_snippet: str | None = None
 
 
 class AssistantPayload(BaseModel):
@@ -550,6 +558,47 @@ class RetrieveResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Grounding helpers
+#
+# _MIN_RETRIEVAL_SCORE — cosine similarity threshold; chunks below this are too
+#   distant to be useful and are excluded from the context window.
+#
+# _GUIDELINE_LANGUAGE_RE — matches confident guideline-style claims in assistant
+#   output (specific orgs, dosages, standard-of-care phrases).  Used by
+#   _check_groundedness to downgrade unsupported responses.
+#
+# _build_no_source_payload — returned when retrieval finds nothing above the
+#   threshold for a non-vague, non-unsafe query.  Honest: never fabricates.
+#
+# _check_groundedness — post-validation safety net.  If sources[] is empty
+#   but the response text contains specific guideline language, downgrade to
+#   uncertain.  One deterministic pass; no I/O; no LLM call.
+# ---------------------------------------------------------------------------
+
+_MIN_RETRIEVAL_SCORE = 0.5
+
+_GUIDELINE_LANGUAGE_RE = re.compile(
+    r"\b("
+    r"wytyczn\w+\s+(?:PTK|ESC|WHO|PTD|AHA|ACC|ERS|EAN)\b"
+    r"|zalecen\w+\s+(?:PTK|ESC|WHO|PTD|AHA|ACC)\b"
+    r"|zgodnie\s+z\s+\w+\s+\d{4}\b"
+    r"|\d+\s*mg\b|\d+\s*µg\b|\d+\s*IU\b"
+    r"|dawka\s+\w+\s+wynosi\b"
+    r"|standard(?:y|owe|ów)?\s+(?:leczenia|postępowania)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _has_guideline_language(text: str) -> bool:
+    """True when text contains specific guideline references or dosages.
+
+    Used only to check assistant-generated output, never raw user input.
+    """
+    return bool(_GUIDELINE_LANGUAGE_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
 # Mock payload factory
 #
 # Returns a schema-valid AssistantPayload tailored to each mode.
@@ -632,17 +681,21 @@ def _build_mock_payload(mode: str) -> AssistantPayload:
     )
 
 
-def _build_raw_payload(mode: str, classified: ClassifiedInput) -> dict[str, Any]:
+def _build_raw_payload(mode: str, classified: ClassifiedInput, rag_context: str = "") -> dict[str, Any]:
     """
     Return the assistant payload as a raw dict for validation.
 
     This is the single seam for Week 2: replace the function body with:
+        system = SYSTEM_PROMPT + ("\n\n" + rag_context if rag_context else "")
         raw_json = await anthropic_client.messages.create(
             model="claude-opus-4-6",
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": classified.for_llm()}],
         )
         return json.loads(raw_json.content[0].text)
+
+    rag_context is pre-formatted by _format_rag_context() and injected as an
+    additional system instruction so the model treats it as source material only.
 
     Patchable in tests — patch "main._build_raw_payload" to inject invalid dicts.
     """
@@ -682,6 +735,67 @@ def _build_uncertain_payload() -> AssistantPayload:
         sources=[],
         flag="uncertain",
         disclaimer=_DISCLAIMER,
+    )
+
+
+def _build_no_source_payload() -> AssistantPayload:
+    """Returned when retrieval finds no chunks above _MIN_RETRIEVAL_SCORE.
+
+    Distinct from _build_uncertain_payload: this communicates a knowledge-base
+    gap, not a vague query.  Prompts the user to provide more detail AND
+    signals that relevant guideline documents may need to be indexed.
+    """
+    return AssistantPayload(
+        questions_to_ask=[
+            "Proszę opisać objawy bardziej szczegółowo.",
+            "Od jak dawna pacjent odczuwa te dolegliwości?",
+            "Czy w bazie wiedzy zaindeksowano odpowiednie dokumenty medyczne?",
+        ],
+        red_flags=[],
+        possible_next_steps=[
+            "Upewnij się, że odpowiednie wytyczne kliniczne zostały zaindeksowane w systemie.",
+        ],
+        patient_facing_summary=(
+            "Brak wystarczających danych źródłowych. "
+            "Asystent nie może udzielić odpowiedzi bez dostępu do odpowiednich wytycznych."
+        ),
+        sources=[],
+        flag="uncertain",
+        disclaimer=_DISCLAIMER,
+    )
+
+
+def _check_groundedness(payload: AssistantPayload, high_confidence: list[dict]) -> AssistantPayload:
+    """Downgrade to uncertain if sources[] is empty but the response contains
+    specific guideline language (dosages, org-named guidelines, standard-of-care phrases).
+
+    Deterministic — no I/O, no LLM call.  One pass, never loops.
+    Only fires when sources[] is empty; payloads with citations pass through unchanged.
+    Refuse payloads are never touched (flag='refuse' is intentional).
+    """
+    if payload.sources or payload.flag == "refuse":
+        return payload
+
+    combined = " ".join(
+        [payload.patient_facing_summary, *payload.possible_next_steps]
+    )
+    if not _has_guideline_language(combined):
+        return payload
+
+    return AssistantPayload(
+        questions_to_ask=[
+            "Brak wystarczających danych źródłowych do udzielenia tej odpowiedzi.",
+            *payload.questions_to_ask[:3],
+        ],
+        red_flags=payload.red_flags,
+        possible_next_steps=[],
+        patient_facing_summary=(
+            "Brak wystarczających danych źródłowych. "
+            "Asystent nie może udzielić odpowiedzi bez dostępu do odpowiednich wytycznych."
+        ),
+        sources=[],
+        flag="uncertain",
+        disclaimer=payload.disclaimer,
     )
 
 
@@ -794,7 +908,8 @@ async def chat(
     input_length = len(body.input_text)
     status_code = 200
     classified: ClassifiedInput | None = None  # set in try block; read safely in finally
-    retrieved: list[dict] = []  # set in try block; count logged in finally
+    retrieved: list[dict] = []          # set in try block; count logged in finally
+    high_confidence: list[dict] = []    # filtered subset of retrieved above threshold
 
     # Logged on arrival — never includes raw content.
     logger.info(
@@ -923,33 +1038,32 @@ async def chat(
         )
 
         # 2a. Retrieve context — non-blocking, degrades to [] on any failure ---
-        # Retrieved chunks are used to populate sources[] in the response.
-        # In mock mode the content is not forwarded to an LLM, but _format_rag_context
-        # is ready for Week 3 — see its docstring for the integration point.
-        # Privacy: retrieved content is never logged (only the count is safe).
+        # Privacy: chunk content and query text are never logged (only counts).
         retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
-        # Week 3: uncomment and pass _rag_context to anthropic.messages.create.
-        # _rag_context = _format_rag_context(retrieved)
+        # Only chunks above the confidence threshold are used for grounding.
+        high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
+        rag_context = _format_rag_context(high_confidence)
 
         # 3. Build raw payload dict -------------------------------------------
-        # Log the routing decision before building; _build_raw_payload is pure.
         if classified.is_unsafe_request:
             logger.warning("unsafe_request_refused", extra={"request_id": request_id})
         elif classified.is_vague:
             logger.info("vague_input_uncertain", extra={"request_id": request_id})
 
-        raw_dict = _build_raw_payload(body.mode, classified)
+        raw_dict = _build_raw_payload(body.mode, classified, rag_context)
 
-        # 3a. Inject sources from retrieved chunks (even in mock mode) ---------
-        # sources[] references doc_id + title only — never chunk content.
-        if retrieved:
+        # 3a. Inject sources — chunk_id + snippet, only from actual retrieval.
+        # Never invented.  text_snippet is truncated to _SNIPPET_LEN for the
+        # UI debug toggle; it is not logged.
+        if high_confidence:
             raw_dict["sources"] = [
                 {
-                    "id": str(r["doc_id"]),
+                    "id": str(r["chunk_id"]),
                     "title": r["title"],
                     "section": r.get("section") or "",
+                    "text_snippet": r["content"][:_SNIPPET_LEN],
                 }
-                for r in retrieved
+                for r in high_confidence
             ]
 
         # 4. Validate — repair once if needed — validate again ----------------
@@ -983,6 +1097,20 @@ async def chat(
 
         if repair_applied:
             logger.warning("payload_repaired", extra={"request_id": request_id})
+
+        # 4a. Groundedness enforcement ----------------------------------------
+        # No-source fallback: non-vague, non-unsafe query with no high-confidence
+        # chunks → override with an explicit "no supporting documents" uncertain payload.
+        # Keeps the response honest: we never answer with guideline-level confidence
+        # when the knowledge base has no relevant material.
+        if not high_confidence and not classified.is_unsafe_request and not classified.is_vague:
+            logger.info("no_source_fallback", extra={"request_id": request_id})
+            payload = _build_no_source_payload()
+        else:
+            # Post-check: if sources[] empty but response contains specific guideline
+            # language (dosages, org refs), downgrade to uncertain.  Safety net for
+            # cases where the LLM generates confident claims without retrieved backing.
+            payload = _check_groundedness(payload, high_confidence)
 
         # 5. Insert assistant message — validation must pass before storage ---
         # Raw invalid output is never stored; only the repaired-and-validated payload.
@@ -1049,7 +1177,7 @@ async def chat(
                 "prompt_version": PROMPT_VERSION,
                 # counts only — never raw content
                 "injection_flag_count": len(classified.injection_flags) if classified else 0,
-                "retrieved_count": len(retrieved),
+                "retrieved_count": len(high_confidence),
             },
         )
 
@@ -1133,8 +1261,23 @@ async def chat_stream(
                 headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
             )
 
-    # Build and validate payload (same logic as /chat).
-    raw_dict = _build_raw_payload(body.mode, classified)
+    # Retrieve context and build payload (same logic as /chat).
+    retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
+    high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
+    rag_context = _format_rag_context(high_confidence)
+
+    raw_dict = _build_raw_payload(body.mode, classified, rag_context)
+    if high_confidence:
+        raw_dict["sources"] = [
+            {
+                "id": str(r["chunk_id"]),
+                "title": r["title"],
+                "section": r.get("section") or "",
+                "text_snippet": r["content"][:_SNIPPET_LEN],
+            }
+            for r in high_confidence
+        ]
+
     try:
         payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
     except ValidationError as exc:
@@ -1148,6 +1291,11 @@ async def chat_stream(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             request_id,
         ) from None
+
+    if not high_confidence and not classified.is_unsafe_request and not classified.is_vague:
+        payload = _build_no_source_payload()
+    else:
+        payload = _check_groundedness(payload, high_confidence)
 
     # Persist user message.
     user_meta: dict[str, Any] = {
