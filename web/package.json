@@ -6,13 +6,25 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "db:push": "supabase db push --workdir ..",
+    "db:status": "supabase migration list --workdir ..",
+    "db:new": "supabase migration new --workdir ..",
+    "db:diff": "supabase db diff --workdir ..",
+    "db:types": "supabase gen types typescript --linked --workdir .. > lib/database.types.ts",
+    "db:reset": "supabase db reset --workdir ..",
+    "db:repair": "supabase migration repair --status applied --workdir .."
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.99.1",
     "next": "^16.2.1",
     "react": "19.2.3",
     "react-dom": "19.2.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "supabase"
+    ]
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -23,6 +35,7 @@
     "eslint-config-next": "16.1.6",
     "prettier": "^3.8.1",
     "shadcn": "^4.0.5",
+    "supabase": "^2.84.7",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

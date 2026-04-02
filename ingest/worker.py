@@ -210,9 +210,22 @@ async def process_doc(
     file_hash: str = doc["file_hash"]
     start = time.perf_counter()
 
-    logger.info("doc_ingest_start", extra={"doc_id": doc_id, "filename": filename})
+    logger.info("doc_ingest_start", extra={"doc_id": doc_id, "doc_filename": filename})
 
     try:
+        # 0. Claim the document: pending → processing. -------------------------
+        # If two workers race, both will set 'processing'. That is safe because
+        # the chunk-deletion step is idempotent and only one will ultimately win
+        # the final status update. For the MVP this is acceptable; a SELECT FOR
+        # UPDATE advisory lock can be added later if needed.
+        await _db_patch(
+            client,
+            "/docs",
+            {"id": f"eq.{doc_id}"},
+            {"status": "processing"},
+            settings,
+        )
+
         # 1. Download the file from Storage. -----------------------------------
         file_bytes = await _storage_download(client, storage_path, settings)
 
@@ -262,12 +275,12 @@ async def process_doc(
         ]
         await _db_post(client, "/doc_chunks", rows, settings)
 
-        # 6. Mark the parent doc as indexed. -----------------------------------
+        # 7. Mark the parent doc as ready + record timestamp. -----------------
         await _db_patch(
             client,
             "/docs",
             {"id": f"eq.{doc_id}"},
-            {"status": "indexed"},
+            {"status": "ready", "last_ingested_at": "now()"},
             settings,
         )
 
@@ -276,34 +289,37 @@ async def process_doc(
             "doc_ingest_done",
             extra={
                 "doc_id": doc_id,
-                "filename": filename,
+                "doc_filename": filename,
                 "file_hash": file_hash,
                 "chunk_count": len(chunks),
                 "elapsed_ms": elapsed_ms,
-                "status": "indexed",
+                "status": "ready",
             },
         )
 
     except Exception as exc:
         elapsed_ms = round((time.perf_counter() - start) * 1000)
+        # Truncate error to 200 chars — enough to identify the problem without
+        # leaking large stack traces or document content into the DB.
+        error_code = str(exc)[:200]
         logger.error(
             "doc_ingest_failed",
             extra={
                 "doc_id": doc_id,
-                "filename": filename,
+                "doc_filename": filename,
                 "elapsed_ms": elapsed_ms,
-                # str(exc) is safe: it never contains raw document content.
-                "error": str(exc),
+                "error": error_code,
             },
         )
-        # Best-effort: mark as failed so the admin knows to investigate.
-        # If this patch also fails, the doc stays 'pending' and will be retried.
+        # Best-effort: mark as failed + record error code so the admin knows
+        # what went wrong. If this patch also fails, the doc stays 'processing'
+        # — the runbook documents how to reset stuck documents.
         try:
             await _db_patch(
                 client,
                 "/docs",
                 {"id": f"eq.{doc_id}"},
-                {"status": "failed"},
+                {"status": "failed", "last_error_code": error_code},
                 settings,
             )
         except Exception:
@@ -315,7 +331,7 @@ async def process_doc(
 # Entry points
 # ---------------------------------------------------------------------------
 
-_DOC_SELECT = "id,filename,storage_path,file_hash,status,version"
+_DOC_SELECT = "id,filename,storage_path,file_hash,status,version,last_ingested_at,last_error_code"
 
 
 async def run_one(doc_id: str, settings: Settings) -> None:
@@ -337,10 +353,30 @@ async def run_one(doc_id: str, settings: Settings) -> None:
 
 
 async def run_all(settings: Settings) -> None:
-    """Process all documents with status='pending', oldest first."""
+    """Process all documents with status='pending', oldest first.
+
+    Concurrency guard: if any document is currently in 'processing' state
+    another worker is already running (or a previous run crashed). The function
+    logs a warning and returns early in that case.  To recover from a crashed
+    run, see the ingest runbook (docs/ingest-runbook.md).
+    """
     embedder = OpenAIEmbedder(settings.openai_api_key, settings.embed_model)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            # Concurrency check: bail out if another worker is already running.
+            processing = await _db_get(
+                client,
+                "/docs",
+                {"status": "eq.processing", "select": "id"},
+                settings,
+            )
+            if processing:
+                logger.warning(
+                    "ingest_already_running",
+                    extra={"processing_count": len(processing)},
+                )
+                return
+
             rows = await _db_get(
                 client,
                 "/docs",

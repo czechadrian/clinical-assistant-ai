@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -518,6 +518,8 @@ class DocOut(BaseModel):
     file_hash: str
     version: str
     status: str
+    last_ingested_at: str | None = None
+    last_error_code: str | None = None
     created_at: str
     updated_at: str
 
@@ -681,7 +683,9 @@ def _build_mock_payload(mode: str) -> AssistantPayload:
     )
 
 
-def _build_raw_payload(mode: str, classified: ClassifiedInput, rag_context: str = "") -> dict[str, Any]:
+def _build_raw_payload(
+    mode: str, classified: ClassifiedInput, rag_context: str = ""
+) -> dict[str, Any]:
     """
     Return the assistant payload as a raw dict for validation.
 
@@ -776,9 +780,7 @@ def _check_groundedness(payload: AssistantPayload, high_confidence: list[dict]) 
     if payload.sources or payload.flag == "refuse":
         return payload
 
-    combined = " ".join(
-        [payload.patient_facing_summary, *payload.possible_next_steps]
-    )
+    combined = " ".join([payload.patient_facing_summary, *payload.possible_next_steps])
     if not _has_guideline_language(combined):
         return payload
 
@@ -908,8 +910,8 @@ async def chat(
     input_length = len(body.input_text)
     status_code = 200
     classified: ClassifiedInput | None = None  # set in try block; read safely in finally
-    retrieved: list[dict] = []          # set in try block; count logged in finally
-    high_confidence: list[dict] = []    # filtered subset of retrieved above threshold
+    retrieved: list[dict] = []  # set in try block; count logged in finally
+    high_confidence: list[dict] = []  # filtered subset of retrieved above threshold
 
     # Logged on arrival — never includes raw content.
     logger.info(
@@ -1359,7 +1361,7 @@ async def list_docs(auth: Auth = Depends(get_auth)):  # noqa: B008
         "/docs",
         {
             "order": "created_at.desc",
-            "select": "id,title,filename,storage_path,file_hash,version,status,created_at,updated_at",
+            "select": "id,title,filename,storage_path,file_hash,version,status,last_ingested_at,last_error_code,created_at,updated_at",
         },
         auth.jwt,
     )
@@ -1388,6 +1390,166 @@ async def create_doc(
         auth.jwt,
     )
     return DocOut(**row)
+
+
+# ---------------------------------------------------------------------------
+# Admin ingest endpoints (Day 20 — automation)
+# ---------------------------------------------------------------------------
+
+
+class IngestTriggerResponse(BaseModel):
+    queued: int
+    message: str
+
+
+class IngestStatusResponse(BaseModel):
+    counts: dict[str, int]
+    total: int
+
+
+async def _is_admin(user_id: str, jwt: str) -> bool:
+    """Return True if the authenticated user has role='admin' in profiles."""
+    rows = await _db_select(
+        "/profiles",
+        {"id": f"eq.{user_id}", "select": "role"},
+        jwt,
+    )
+    return bool(rows and rows[0].get("role") == "admin")
+
+
+async def _run_ingest_background() -> None:
+    """Thin wrapper so tests can patch this instead of importing worker."""
+    from worker import run_all as _worker_run_all
+
+    await _worker_run_all(settings)
+
+
+@app.post("/admin/ingest", response_model=IngestTriggerResponse, status_code=202)
+async def trigger_ingest(
+    background_tasks: BackgroundTasks,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    """Trigger a background ingest run for all pending documents.
+
+    Admin role required.  Returns 409 if an ingest run is already in progress.
+    The worker executes asynchronously; poll GET /admin/ingest/status or
+    GET /docs to track progress.
+    """
+    if not await _is_admin(auth.user_id, auth.jwt):
+        raise AppError(
+            "FORBIDDEN",
+            "Admin role required to trigger ingest.",
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    if not settings.openai_api_key:
+        raise AppError(
+            "CONFIGURATION_ERROR",
+            "OPENAI_API_KEY is not configured. Embeddings cannot be generated.",
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    # Concurrency guard: reject if any doc is currently being processed.
+    processing = await _db_select(
+        "/docs",
+        {"status": "eq.processing", "select": "id"},
+        auth.jwt,
+    )
+    if processing:
+        raise AppError(
+            "INGEST_RUNNING",
+            f"An ingest run is already in progress ({len(processing)} document(s) processing).",
+            status.HTTP_409_CONFLICT,
+        )
+
+    pending = await _db_select(
+        "/docs",
+        {"status": "eq.pending", "select": "id"},
+        auth.jwt,
+    )
+    if not pending:
+        return IngestTriggerResponse(queued=0, message="No pending documents to process.")
+
+    background_tasks.add_task(_run_ingest_background)
+    return IngestTriggerResponse(
+        queued=len(pending),
+        message=f"Queued {len(pending)} document(s) for processing.",
+    )
+
+
+@app.post("/admin/ingest/reset-stuck", response_model=IngestTriggerResponse)
+async def reset_stuck_docs(
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    """Reset documents stuck in 'processing' back to 'pending'.
+
+    Use when a worker crashed mid-run and left documents in 'processing'.
+    Admin role required.  See docs/ingest-runbook.md for guidance.
+    """
+    if not await _is_admin(auth.user_id, auth.jwt):
+        raise AppError(
+            "FORBIDDEN",
+            "Admin role required.",
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    stuck = await _db_select(
+        "/docs",
+        {"status": "eq.processing", "select": "id"},
+        auth.jwt,
+    )
+    if not stuck:
+        return IngestTriggerResponse(queued=0, message="No stuck documents found.")
+
+    # Patch each stuck document back to pending using service role
+    # (user JWT cannot update docs to arbitrary states without going through
+    # the admin-only UPDATE policy; service role bypasses RLS).
+    import httpx as _httpx
+
+    service_headers = {
+        "apikey": settings.supabase_service_role_key,
+        "Authorization": f"Bearer {settings.supabase_service_role_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    async with _httpx.AsyncClient(
+        base_url=f"{settings.supabase_url}/rest/v1",
+        timeout=_TIMEOUT,
+    ) as svc:
+        resp = await svc.patch(
+            "/docs",
+            params={"status": "eq.processing"},
+            json={"status": "pending"},
+            headers=service_headers,
+        )
+        resp.raise_for_status()
+
+    count = len(stuck)
+    logger.info("reset_stuck_docs", extra={"count": count, "user_id": auth.user_id})
+    return IngestTriggerResponse(
+        queued=count,
+        message=f"Reset {count} stuck document(s) to 'pending'.",
+    )
+
+
+@app.get("/admin/ingest/status", response_model=IngestStatusResponse)
+async def ingest_status(
+    auth: Auth = Depends(get_auth),  # noqa: B008
+):
+    """Return document counts grouped by status.  Admin role required."""
+    if not await _is_admin(auth.user_id, auth.jwt):
+        raise AppError(
+            "FORBIDDEN",
+            "Admin role required.",
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    rows = await _db_select("/docs", {"select": "status"}, auth.jwt)
+    counts: dict[str, int] = {}
+    for row in rows:
+        s = row.get("status", "unknown")
+        counts[s] = counts.get(s, 0) + 1
+    return IngestStatusResponse(counts=counts, total=len(rows))
 
 
 # ---------------------------------------------------------------------------

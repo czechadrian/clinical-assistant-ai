@@ -231,13 +231,39 @@ export type DocOut = {
   storage_path: string;
   file_hash: string;
   version: string;
-  status: "pending" | "indexed" | "failed";
+  // 'indexed' kept for backward compatibility with rows written by worker v1.
+  // New rows produced by worker v2 use 'ready'.
+  status: "pending" | "processing" | "ready" | "indexed" | "failed";
+  last_ingested_at: string | null;
+  last_error_code: string | null;
   created_at: string;
   updated_at: string;
 };
 
+export type IngestStatus = {
+  counts: Record<string, number>;
+  total: number;
+};
+
+export type IngestTriggerResponse = {
+  queued: number;
+  message: string;
+};
+
 export async function listDocs(): Promise<DocOut[]> {
   return apiFetch<DocOut[]>("/docs");
+}
+
+export async function triggerIngest(): Promise<IngestTriggerResponse> {
+  return apiFetch<IngestTriggerResponse>("/admin/ingest", { method: "POST" });
+}
+
+export async function getIngestStatus(): Promise<IngestStatus> {
+  return apiFetch<IngestStatus>("/admin/ingest/status");
+}
+
+export async function resetStuckDocs(): Promise<IngestTriggerResponse> {
+  return apiFetch<IngestTriggerResponse>("/admin/ingest/reset-stuck", { method: "POST" });
 }
 
 export async function postChat(
