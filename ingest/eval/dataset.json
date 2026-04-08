@@ -1,0 +1,292 @@
+{
+  "version": "1.0",
+  "description": "RAG evaluation dataset for Kliniczny Asystent AI. No real patient data. Questions are generic clinical tasks used to measure retrieval quality.",
+  "notes": [
+    "expected_doc_id: fill in with the real UUID from your docs table after uploading the corresponding guideline.",
+    "expected_doc_keywords: used as a fallback hit check when expected_doc_id is null (title substring match, case-insensitive).",
+    "answerable=true means: a correctly indexed guideline SHOULD produce >=1 chunk above the retrieval threshold.",
+    "answerable=false means: no indexed guideline is expected to match; system should return flag=uncertain via no-source fallback."
+  ],
+  "questions": [
+    {
+      "id": "q001",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "Patient 65M with chest pain radiating to left arm, diaphoresis, onset 45 minutes ago. BP 150/90, HR 105. What are the immediate management steps for suspected ACS?",
+      "answerable": true,
+      "expected_doc_keywords": ["OZW", "ACS", "kardiolog", "PTK", "zawał"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q002",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "STEMI confirmed on ECG in a 58-year-old male. Door-to-balloon time target and reperfusion strategy per current guidelines.",
+      "answerable": true,
+      "expected_doc_keywords": ["STEMI", "OZW", "PTK", "reperfuzja", "angioplastyka"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q003",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "Heart failure with reduced ejection fraction (HFrEF), EF 30%. What is the recommended pharmacological treatment backbone per ESC guidelines?",
+      "answerable": true,
+      "expected_doc_keywords": ["niewydolność serca", "HFrEF", "ESC", "kardiolog"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q004",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "Patient with hypertension, current BP 175/105 despite lifestyle changes. What are the recommended BP treatment targets and first-line drug classes?",
+      "answerable": true,
+      "expected_doc_keywords": ["nadciśnienie", "hipertensja", "PTK", "ESC", "ciśnienie tętnicze"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q005",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "Atrial fibrillation in a 70-year-old with CHA2DS2-VASc score of 3. What anticoagulation strategy is recommended?",
+      "answerable": true,
+      "expected_doc_keywords": ["migotanie przedsionków", "AF", "antykoagulacja", "ESC", "PTK"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q006",
+      "category": "answerable_cardiovascular",
+      "mode": "triage",
+      "question": "Patient with LDL-C 4.8 mmol/L and established cardiovascular disease. What are statin therapy targets and when should combination therapy be considered?",
+      "answerable": true,
+      "expected_doc_keywords": ["dyslipidemia", "statyna", "LDL", "ESC", "PTK"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q007",
+      "category": "answerable_respiratory",
+      "mode": "triage",
+      "question": "COPD patient, GOLD stage III, frequent exacerbations. What is the recommended maintenance inhaler therapy?",
+      "answerable": true,
+      "expected_doc_keywords": ["POChP", "COPD", "GOLD", "inhalator"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q008",
+      "category": "answerable_respiratory",
+      "mode": "triage",
+      "question": "Acute exacerbation of COPD requiring hospitalisation. What are the initial treatment steps including bronchodilators, steroids, and antibiotics?",
+      "answerable": true,
+      "expected_doc_keywords": ["POChP", "COPD", "zaostrzenie", "antybiotyk"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q009",
+      "category": "answerable_respiratory",
+      "mode": "triage",
+      "question": "Community-acquired pneumonia in a 55-year-old, PSI class III. What antibiotic regimen is recommended for outpatient treatment?",
+      "answerable": true,
+      "expected_doc_keywords": ["zapalenie płuc", "pneumonia", "antybiotyk", "PSI"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q010",
+      "category": "answerable_respiratory",
+      "mode": "triage",
+      "question": "Suspected pulmonary embolism, haemodynamically stable, Wells score 5. What is the initial anticoagulation approach?",
+      "answerable": true,
+      "expected_doc_keywords": ["zatorowość płucna", "PE", "antykoagulacja", "ESC"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q011",
+      "category": "answerable_endocrinology",
+      "mode": "triage",
+      "question": "Newly diagnosed type 2 diabetes, HbA1c 8.5%, no cardiovascular disease. What is the recommended first-line pharmacological treatment?",
+      "answerable": true,
+      "expected_doc_keywords": ["cukrzyca", "diabetes", "metformina", "PTD", "HbA1c"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q012",
+      "category": "answerable_endocrinology",
+      "mode": "triage",
+      "question": "Patient on insulin presents with blood glucose 2.1 mmol/L, conscious. What is the hypoglycaemia management protocol?",
+      "answerable": true,
+      "expected_doc_keywords": ["hipoglikemia", "insulina", "cukrzyca", "glukoza"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q013",
+      "category": "answerable_endocrinology",
+      "mode": "triage",
+      "question": "Hypothyroidism on levothyroxine, TSH 12 mU/L on current dose. What are the TSH treatment targets and dose adjustment principles?",
+      "answerable": true,
+      "expected_doc_keywords": ["niedoczynność tarczycy", "lewotyroksyną", "TSH", "tyreoidy"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q014",
+      "category": "answerable_neurology",
+      "mode": "triage",
+      "question": "Ischaemic stroke, symptom onset 2.5 hours ago, no contraindications. What is the thrombolysis eligibility window and alteplase dosing?",
+      "answerable": true,
+      "expected_doc_keywords": ["udar", "trombolityczna", "alteplaza", "ESO", "neurolog"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q015",
+      "category": "answerable_neurology",
+      "mode": "triage",
+      "question": "TIA confirmed, ABCD2 score 5, 12 hours ago. What dual antiplatelet and secondary stroke prevention strategy is recommended?",
+      "answerable": true,
+      "expected_doc_keywords": ["TIA", "udar", "antyplatelet", "klopidogrel", "aspiryna"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q016",
+      "category": "answerable_pharmacology",
+      "mode": "triage",
+      "question": "Acute coronary syndrome managed with PCI. What is the recommended dual antiplatelet therapy duration and aspirin dose?",
+      "answerable": true,
+      "expected_doc_keywords": ["OZW", "DAPT", "aspiryna", "klopidogrel", "tikagrelor"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q017",
+      "category": "answerable_pharmacology",
+      "mode": "triage",
+      "question": "Patient on warfarin with supratherapeutic INR of 7.5, no active bleeding. What is the reversal and monitoring approach?",
+      "answerable": true,
+      "expected_doc_keywords": ["warfaryna", "INR", "antagoniści witaminy K", "antykoagulant"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q018",
+      "category": "answerable_pharmacology",
+      "mode": "triage",
+      "question": "Heart failure patient on ACE inhibitor. Creatinine has risen 30% after initiation. When should ACE inhibitor be stopped?",
+      "answerable": true,
+      "expected_doc_keywords": ["ACE", "inhibitor", "niewydolność serca", "kreatynina", "nerki"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q019",
+      "category": "answerable_general",
+      "mode": "triage",
+      "question": "Sepsis confirmed, blood cultures drawn. What is the recommended antibiotic administration timing relative to diagnosis?",
+      "answerable": true,
+      "expected_doc_keywords": ["sepsa", "sepsis", "antybiotyk", "posocznica"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q020",
+      "category": "answerable_general",
+      "mode": "summary",
+      "question": "Summarise the management of a patient with hypertensive crisis (BP 210/120) who was treated with IV labetalol and discharged on amlodipine 10mg.",
+      "answerable": true,
+      "expected_doc_keywords": ["nadciśnienie", "przełom", "labetalol", "amlodypina"],
+      "expected_doc_id": null
+    },
+    {
+      "id": "q021",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "What are the optimal management protocols for decompression sickness in recreational scuba divers?",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Diving medicine — unlikely in any standard internal medicine guideline collection"
+    },
+    {
+      "id": "q022",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "Management of theriogenology conditions in bovine obstetrics — retained placenta treatment.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Veterinary medicine — completely outside scope"
+    },
+    {
+      "id": "q023",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "Traditional Ayurvedic ashwagandha and shilajit combination effects on cardiovascular biomarkers.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Alternative medicine without evidence base in standard clinical guidelines"
+    },
+    {
+      "id": "q024",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "Experimental gene therapy protocol for Duchenne muscular dystrophy using exon 51 skipping in paediatric patients.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Highly specialised experimental therapy — not in standard clinical guidelines"
+    },
+    {
+      "id": "q025",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "Space medicine: cardiovascular adaptations and countermeasures for long-duration microgravity exposure.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Aerospace medicine — outside standard clinical guideline collections"
+    },
+    {
+      "id": "q026",
+      "category": "unanswerable_out_of_scope",
+      "mode": "triage",
+      "question": "Phase II trial results for investigational compound XR-7841 in treatment-resistant hypertension.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Fictional investigational drug — not in any guideline"
+    },
+    {
+      "id": "q027",
+      "category": "unanswerable_niche",
+      "mode": "triage",
+      "question": "Diagnosis and management of Münchhausen-by-proxy syndrome in a hospital inpatient setting.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Rare psychiatric-forensic condition — unlikely in indexed guidelines"
+    },
+    {
+      "id": "q028",
+      "category": "unanswerable_niche",
+      "mode": "triage",
+      "question": "Parachute injury management in military paratroopers — orthopaedic and trauma protocol.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Military/sports medicine niche — outside standard clinical guidelines"
+    },
+    {
+      "id": "q029",
+      "category": "unanswerable_niche",
+      "mode": "triage",
+      "question": "Quantum biology applications in optimising cardiac pacemaker lead placement.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Nonsensical premise — no guideline coverage"
+    },
+    {
+      "id": "q030",
+      "category": "unanswerable_niche",
+      "mode": "triage",
+      "question": "Historical humoural theory: bloodletting and phlebotomy indications for hypertensive patients per Galen.",
+      "answerable": false,
+      "expected_doc_keywords": [],
+      "expected_doc_id": null,
+      "notes": "Historical non-evidence-based practice — no modern guideline coverage"
+    }
+  ]
+}

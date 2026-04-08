@@ -23,3 +23,6 @@ web/.env.local
 ingest/.env
 
 # .env.example is intentionally committed as a blank template
+
+# eval results — generated artefacts, never commit
+ingest/eval/results/
