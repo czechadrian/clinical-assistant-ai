@@ -67,6 +67,14 @@ function AssistantBubble({ content }: { content: unknown }) {
     return <span>{getUserText(content)}</span>;
   }
 
+  // Dev-only: read workflow metadata from _meta in stored message content.
+  // Never shown in production — no patient impact.
+  const meta = IS_DEV
+    ? ((content as Record<string, unknown>)?._meta as Record<string, unknown> | undefined)
+    : undefined;
+  const workflowName = meta?.workflow_name as string | undefined;
+  const routerReason = meta?.router_reason as string | undefined;
+
   return (
     <div className="space-y-3 text-sm">
       {/* Flag badge */}
@@ -75,6 +83,16 @@ function AssistantBubble({ content }: { content: unknown }) {
       >
         {FLAG_LABELS[payload.flag]}
       </span>
+
+      {/* Workflow badge — dev/admin only */}
+      {IS_DEV && workflowName && (
+        <span className="ml-2 inline-block rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400">
+          {workflowName}
+          {routerReason && routerReason !== `mode_${workflowName}` && (
+            <span className="text-slate-400"> · {routerReason}</span>
+          )}
+        </span>
+      )}
 
       {/* Red flags — shown first and highlighted */}
       {payload.red_flags.length > 0 && (
@@ -192,6 +210,7 @@ const MODE_LABELS: Record<ChatMode, string> = {
   triage: "Triage",
   summary: "Summary",
   patient_message: "Patient message",
+  doc_qa: "Guideline Q&A",
 };
 
 // Generic placeholder templates — fill the textarea on click.
@@ -211,6 +230,11 @@ const TEMPLATES: Record<ChatMode, string[]> = {
     "Explain [diagnosis] in simple language and describe the prescribed treatment.",
     "Post-procedure instructions for [procedure] — what to expect and when to seek help.",
     "Side effects of [medication] the patient should monitor and report.",
+  ],
+  doc_qa: [
+    "What is the first-line treatment for [condition] per current ESC/PTK guidelines?",
+    "What are the diagnostic criteria for [condition]?",
+    "What is the recommended dosing and monitoring for [drug] in [indication]?",
   ],
 };
 

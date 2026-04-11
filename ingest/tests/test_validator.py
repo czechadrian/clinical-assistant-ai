@@ -1,7 +1,7 @@
 """
 Tests for response validation and repair (Day 10).
 
-Integration cases (via /chat endpoint with mocked DB + patched _build_raw_payload):
+Integration cases (via /chat endpoint with mocked DB + patched _dispatch_workflow):
   a) invalid → repair → valid → 200, repair_applied=True in metadata
   b) invalid → not repairable → 500, safe error message, assistant message NOT stored
   c) normal valid response → 200, repair_applied=False in metadata
@@ -172,11 +172,14 @@ def test_chat_valid_response_no_repair(client):
 
 
 def test_chat_invalid_repaired_to_valid(client):
-    """(a) Repairable invalid payload → 200, repair_applied=True, schema intact."""
+    """(a) Repairable invalid payload → 200, repair_applied=True, schema intact.
+    Note: triage + no embedder → no-source fallback overrides payload after repair.
+    repair_applied=True is still recorded in _meta (computed before fallback).
+    """
     with (
         patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
         patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)) as mock_insert,
-        patch("main._build_raw_payload", return_value=REPAIRABLE_RAW),
+        patch("main._dispatch_workflow", return_value=REPAIRABLE_RAW),
     ):
         resp = client.post("/chat", json=VALID_BODY)
 
@@ -197,7 +200,7 @@ def test_chat_unrepairable_returns_500(client):
     with (
         patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
         patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)) as mock_insert,
-        patch("main._build_raw_payload", return_value=UNREPAIRABLE_RAW),
+        patch("main._dispatch_workflow", return_value=UNREPAIRABLE_RAW),
     ):
         resp = client.post("/chat", json=VALID_BODY)
 
@@ -231,6 +234,8 @@ def test_chat_assistant_meta_has_flags_not_content(client):
     assert "repair_applied" in meta
     assert "prompt_version" in meta
     assert "is_mock" in meta
+    assert "workflow_name" in meta
+    assert "router_reason" in meta
 
     # Payload fields live in content, not duplicated inside _meta
     assert "questions_to_ask" not in meta

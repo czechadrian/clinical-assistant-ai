@@ -193,7 +193,7 @@ def test_validation_failed_error_shape(client):
     with (
         patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
         patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
-        patch("main._build_raw_payload", return_value=UNREPAIRABLE_RAW),
+        patch("main._dispatch_workflow", return_value=UNREPAIRABLE_RAW),
     ):
         resp = client.post("/chat", json=VALID_BODY)
 

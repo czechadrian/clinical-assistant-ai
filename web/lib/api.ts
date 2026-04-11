@@ -195,12 +195,14 @@ export type AssistantPayload = {
   disclaimer: string;
 };
 
-export type ChatMode = "triage" | "summary" | "patient_message";
+export type ChatMode = "triage" | "summary" | "patient_message" | "doc_qa";
 
 export type ResponseMetadata = {
   is_mock: boolean;
   model: string;
   prompt_version: string;
+  workflow: string;       // which workflow pipeline generated this response
+  router_reason: string;  // why the router chose this workflow (safe string, no user content)
 };
 
 export type ChatApiResponse = {

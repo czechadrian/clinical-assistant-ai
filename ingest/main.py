@@ -21,8 +21,10 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from classifier import ClassifiedInput, classify_input  # noqa: F401
 from embedder import OpenAIEmbedder
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
+from router import RouterDecision, route
 from settings import Settings, configure_logging
 from validator import validate_and_repair
+from workflows import run_doc_qa, run_patient_message, run_summary, run_triage
 
 load_dotenv()
 
@@ -431,7 +433,7 @@ class ConversationOut(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    mode: Literal["triage", "summary", "patient_message"]
+    mode: Literal["triage", "summary", "patient_message", "doc_qa"]
     input_text: str = Field(..., min_length=1, max_length=2000)
     conversation_id: str  # required — create via POST /conversations first
 
@@ -495,13 +497,17 @@ class ResponseMetadata(BaseModel):
     """Audit metadata returned alongside every chat response.
 
     Lets callers (and audit logs) know exactly what produced the answer:
-    mock vs. real model, which model ID, and which prompt version was active.
+    mock vs. real model, which model ID, prompt version, and which workflow
+    pipeline was selected by the router.
     Not stored in the messages table — it lives in ChatResponse only.
+    (workflow_name and router_reason ARE stored in message._meta for audit.)
     """
 
     is_mock: bool
     model: str  # "mock-v1" | "claude-opus-4-6" | etc.
     prompt_version: str  # matches policy.PROMPT_VERSION
+    workflow: str = "triage"  # workflow that generated this response
+    router_reason: str = "mode_triage"  # why the router chose this workflow
 
 
 class ChatResponse(BaseModel):
@@ -613,101 +619,31 @@ _DISCLAIMER = (
 )
 
 
-def _build_mock_payload(mode: str) -> AssistantPayload:
-    if mode == "triage":
-        return AssistantPayload(
-            questions_to_ask=[
-                "Jak dlugo trwaja objawy?",
-                "Czy wystepuja objawy alarmowe (bol w klatce piersiowej, dusznosc, utrata przytomnosci)?",
-                "Jakie leki przyjmuje pacjent na stale?",
-            ],
-            red_flags=[
-                "Bol w klatce piersiowej promieniujacy do lewego ramienia lub szczeki — wykluczyc OZW.",
-                "Nagla dusznosc spoczynkowa — pilna ocena ukladu oddechowego i krazenia.",
-            ],
-            possible_next_steps=[
-                "Zebranie pelnego wywiadu lekarskiego i badanie fizykalne.",
-                "EKG 12-odpr. jesli podejrzenie OZW.",
-                "W przypadku objawow zagrazajacych zyciu — natychmiastowe skierowanie na SOR.",
-            ],
-            patient_facing_summary=(
-                "Lekarz zbiera informacje o Twoich objawach, "
-                "aby ocenic, jaka pomoc jest Ci potrzebna."
-            ),
-            sources=[],
-            flag="uncertain",
-            disclaimer=_DISCLAIMER,
-        )
-
-    if mode == "summary":
-        return AssistantPayload(
-            questions_to_ask=[],
-            red_flags=[],
-            possible_next_steps=[
-                "Przekazac podsumowanie kliniczne lekarzowi prowadzacemu.",
-                "Zaktualizowac dokumentacje medyczna pacjenta.",
-            ],
-            patient_facing_summary=(
-                "Ponizej przedstawiono podsumowanie wizyty. "
-                "W razie pytan prosimy o kontakt z lekarzem."
-            ),
-            sources=[
-                Source(
-                    id="mock-summary-001",
-                    title="Standardy dokumentacji medycznej PTL",
-                    section="Rozdzial 3 — Podsumowanie wizyty ambulatoryjnej",
-                )
-            ],
-            flag="safe",
-            disclaimer=_DISCLAIMER,
-        )
-
-    # mode == "patient_message"
-    return AssistantPayload(
-        questions_to_ask=[
-            "Czy rozumiesz zalecenia lekarza i nie masz dodatkowych pytan?",
-        ],
-        red_flags=[],
-        possible_next_steps=[
-            "Przyjmuj leki zgodnie z zaleceniami — nie przerywaj terapii samodzielnie.",
-            "Jesli objawy sie nasilaja lub pojawia sie nowe — skontaktuj sie z lekarzem.",
-            "W nagłym przypadku zadzwon pod numer alarmowy 112.",
-        ],
-        patient_facing_summary=(
-            "Twoj lekarz przygotowal dla Ciebie te informacje. "
-            "Prosimy o zapoznanie sie z nimi i przestrzeganie zalecen."
-        ),
-        sources=[],
-        flag="safe",
-        disclaimer="Te informacje maja charakter pomocniczy i nie zastepuja indywidualnej porady lekarskiej.",
-    )
-
-
-def _build_raw_payload(
-    mode: str, classified: ClassifiedInput, rag_context: str = ""
+def _dispatch_workflow(
+    workflow: str, classified: ClassifiedInput, rag_context: str = ""
 ) -> dict[str, Any]:
+    """Dispatch to the appropriate workflow function and return a raw payload dict.
+
+    Week 3 seam: each branch calls a workflow function that will be replaced with
+    a real LLM call (same signature, different body — see workflows.py docstring).
+
+    Patchable in tests: patch "main._dispatch_workflow" to inject invalid dicts.
+    Only called for the normal path (not unsafe, not vague — those short-circuit earlier).
     """
-    Return the assistant payload as a raw dict for validation.
+    if workflow == "summary":
+        return run_summary(classified, rag_context)
+    if workflow == "patient_message":
+        return run_patient_message(classified, rag_context)
+    if workflow == "doc_qa":
+        return run_doc_qa(classified, rag_context)
+    return run_triage(classified, rag_context)  # default: triage
 
-    This is the single seam for Week 2: replace the function body with:
-        system = SYSTEM_PROMPT + ("\n\n" + rag_context if rag_context else "")
-        raw_json = await anthropic_client.messages.create(
-            model="claude-opus-4-6",
-            system=system,
-            messages=[{"role": "user", "content": classified.for_llm()}],
-        )
-        return json.loads(raw_json.content[0].text)
 
-    rag_context is pre-formatted by _format_rag_context() and injected as an
-    additional system instruction so the model treats it as source material only.
-
-    Patchable in tests — patch "main._build_raw_payload" to inject invalid dicts.
-    """
-    if classified.is_unsafe_request:
-        return _build_refuse_payload().model_dump()
-    if classified.is_vague:
-        return _build_uncertain_payload().model_dump()
-    return _build_mock_payload(mode).model_dump()
+# Workflows that require retrieved sources to produce a trustworthy response.
+# When high_confidence=[] for these workflows, the no-source fallback fires.
+# summary and patient_message operate on the clinician's provided note text;
+# sources are optional enrichment, not a hard requirement.
+_REQUIRES_SOURCES = frozenset({"triage", "doc_qa"})
 
 
 def _build_refuse_payload() -> AssistantPayload:
@@ -910,6 +846,7 @@ async def chat(
     input_length = len(body.input_text)
     status_code = 200
     classified: ClassifiedInput | None = None  # set in try block; read safely in finally
+    decision: RouterDecision | None = None  # set after route(); None on early exits
     retrieved: list[dict] = []  # set in try block; count logged in finally
     high_confidence: list[dict] = []  # filtered subset of retrieved above threshold
 
@@ -1008,10 +945,25 @@ async def chat(
                         is_mock=meta.get("is_mock", True),
                         model=meta.get("model", "mock-v1"),
                         prompt_version=meta.get("prompt_version", PROMPT_VERSION),
+                        workflow=meta.get("workflow_name", body.mode),
+                        router_reason=meta.get("router_reason", f"mode_{body.mode}"),
                     ),
                 )
 
-        # 2. Insert user message — include classification metadata -----------
+        # 2. Route request to the appropriate workflow -------------------------
+        # Runs after safety checks but before any DB writes so router_reason
+        # is available for both user and assistant message metadata.
+        decision = route(body.mode, body.input_text)
+        logger.info(
+            "workflow_routed",
+            extra={
+                "request_id": request_id,
+                "workflow": decision.workflow,
+                "router_reason": decision.reason,
+            },
+        )
+
+        # 3. Insert user message — include classification + routing metadata --
         # _meta stores flag labels and a content-hash for audit.
         # It never stores raw flagged substrings or patient text.
         user_meta: dict[str, Any] = {
@@ -1020,6 +972,8 @@ async def chat(
             "is_vague": classified.is_vague,
             "is_unsafe_request": classified.is_unsafe_request,
             "prompt_version": PROMPT_VERSION,
+            "workflow_name": decision.workflow,
+            "router_reason": decision.reason,
         }
         if idempotency_key:
             user_meta["idempotency_key"] = idempotency_key
@@ -1039,25 +993,29 @@ async def chat(
             auth.jwt,
         )
 
-        # 2a. Retrieve context — non-blocking, degrades to [] on any failure ---
+        # 4. Retrieve context — non-blocking, degrades to [] on any failure ---
         # Privacy: chunk content and query text are never logged (only counts).
         retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
         # Only chunks above the confidence threshold are used for grounding.
         high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
         rag_context = _format_rag_context(high_confidence)
 
-        # 3. Build raw payload dict -------------------------------------------
+        # 5. Build raw payload dict -------------------------------------------
+        # Safety gates are checked first (short-circuit); normal path dispatches
+        # to the workflow function selected by the router.
         if classified.is_unsafe_request:
             logger.warning("unsafe_request_refused", extra={"request_id": request_id})
+            raw_dict = _build_refuse_payload().model_dump()
         elif classified.is_vague:
             logger.info("vague_input_uncertain", extra={"request_id": request_id})
+            raw_dict = _build_uncertain_payload().model_dump()
+        else:
+            raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
 
-        raw_dict = _build_raw_payload(body.mode, classified, rag_context)
-
-        # 3a. Inject sources — chunk_id + snippet, only from actual retrieval.
+        # 5a. Inject sources — chunk_id + snippet, only from actual retrieval.
         # Never invented.  text_snippet is truncated to _SNIPPET_LEN for the
         # UI debug toggle; it is not logged.
-        if high_confidence:
+        if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
             raw_dict["sources"] = [
                 {
                     "id": str(r["chunk_id"]),
@@ -1100,13 +1058,23 @@ async def chat(
         if repair_applied:
             logger.warning("payload_repaired", extra={"request_id": request_id})
 
-        # 4a. Groundedness enforcement ----------------------------------------
-        # No-source fallback: non-vague, non-unsafe query with no high-confidence
-        # chunks → override with an explicit "no supporting documents" uncertain payload.
-        # Keeps the response honest: we never answer with guideline-level confidence
-        # when the knowledge base has no relevant material.
-        if not high_confidence and not classified.is_unsafe_request and not classified.is_vague:
-            logger.info("no_source_fallback", extra={"request_id": request_id})
+        # 6a. Groundedness enforcement ----------------------------------------
+        # No-source fallback: for workflows that require retrieved sources
+        # (_REQUIRES_SOURCES), a non-vague non-unsafe query with no high-confidence
+        # chunks returns the explicit "no supporting documents" uncertain payload.
+        # doc_qa contractually requires sources; triage benefits from guideline context.
+        # summary and patient_message operate on provided note text — sources are
+        # optional enrichment so they fall through to _check_groundedness.
+        if (
+            not high_confidence
+            and not classified.is_unsafe_request
+            and not classified.is_vague
+            and decision.workflow in _REQUIRES_SOURCES
+        ):
+            logger.info(
+                "no_source_fallback",
+                extra={"request_id": request_id, "workflow": decision.workflow},
+            )
             payload = _build_no_source_payload()
         else:
             # Post-check: if sources[] empty but response contains specific guideline
@@ -1114,7 +1082,7 @@ async def chat(
             # cases where the LLM generates confident claims without retrieved backing.
             payload = _check_groundedness(payload, high_confidence)
 
-        # 5. Insert assistant message — validation must pass before storage ---
+        # 7. Insert assistant message — validation must pass before storage ---
         # Raw invalid output is never stored; only the repaired-and-validated payload.
         assistant_meta: dict[str, Any] = {
             "prompt_version": PROMPT_VERSION,
@@ -1122,6 +1090,8 @@ async def chat(
             "is_mock": True,
             "validation_status": "valid",
             "repair_applied": repair_applied,
+            "workflow_name": decision.workflow,
+            "router_reason": decision.reason,
         }
         if idempotency_key:
             assistant_meta["idempotency_key"] = idempotency_key
@@ -1147,6 +1117,8 @@ async def chat(
                 is_mock=True,
                 model="mock-v1",
                 prompt_version=PROMPT_VERSION,
+                workflow=decision.workflow,
+                router_reason=decision.reason,
             ),
         )
 
@@ -1177,6 +1149,9 @@ async def chat(
                 "latency_ms": round((time.perf_counter() - start) * 1000),
                 "is_mock": settings.chat_mock_mode,
                 "prompt_version": PROMPT_VERSION,
+                # router metadata — safe strings, no user content
+                "workflow": decision.workflow if decision else "unrouted",
+                "router_reason": decision.reason if decision else "none",
                 # counts only — never raw content
                 "injection_flag_count": len(classified.injection_flags) if classified else 0,
                 "retrieved_count": len(high_confidence),
@@ -1263,13 +1238,21 @@ async def chat_stream(
                 headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
             )
 
-    # Retrieve context and build payload (same logic as /chat).
+    # Route, retrieve, and build payload (mirrors /chat logic).
+    decision = route(body.mode, body.input_text)
+
     retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
     high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
     rag_context = _format_rag_context(high_confidence)
 
-    raw_dict = _build_raw_payload(body.mode, classified, rag_context)
-    if high_confidence:
+    if classified.is_unsafe_request:
+        raw_dict = _build_refuse_payload().model_dump()
+    elif classified.is_vague:
+        raw_dict = _build_uncertain_payload().model_dump()
+    else:
+        raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
+
+    if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
         raw_dict["sources"] = [
             {
                 "id": str(r["chunk_id"]),
@@ -1294,7 +1277,12 @@ async def chat_stream(
             request_id,
         ) from None
 
-    if not high_confidence and not classified.is_unsafe_request and not classified.is_vague:
+    if (
+        not high_confidence
+        and not classified.is_unsafe_request
+        and not classified.is_vague
+        and decision.workflow in _REQUIRES_SOURCES
+    ):
         payload = _build_no_source_payload()
     else:
         payload = _check_groundedness(payload, high_confidence)
@@ -1306,6 +1294,8 @@ async def chat_stream(
         "is_vague": classified.is_vague,
         "is_unsafe_request": classified.is_unsafe_request,
         "prompt_version": PROMPT_VERSION,
+        "workflow_name": decision.workflow,
+        "router_reason": decision.reason,
     }
     if idempotency_key:
         user_meta["idempotency_key"] = idempotency_key
@@ -1328,6 +1318,8 @@ async def chat_stream(
         "is_mock": True,
         "validation_status": "valid",
         "repair_applied": repair_applied,
+        "workflow_name": decision.workflow,
+        "router_reason": decision.reason,
     }
     if idempotency_key:
         assistant_meta["idempotency_key"] = idempotency_key
