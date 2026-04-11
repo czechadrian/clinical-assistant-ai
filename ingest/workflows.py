@@ -45,20 +45,10 @@ doc_qa          Source-grounded answer.
 from typing import Any
 
 from classifier import ClassifiedInput
+from constants import DISCLAIMER_CLINICAL, DISCLAIMER_PATIENT
 
-# ---------------------------------------------------------------------------
-# Disclaimer strings — stable, safe to log
-# ---------------------------------------------------------------------------
-
-_DISCLAIMER = (
-    "Asystent AI nie zastępuje porady lekarskiej ani decyzji klinicznej. "
-    "Zawsze konsultuj się z wykwalifikowanym specjalistą."
-)
-
-_PATIENT_DISCLAIMER = (
-    "Te informacje mają charakter pomocniczy i nie zastępują indywidualnej porady lekarskiej. "
-    "W nagłym przypadku zadzwoń pod numer alarmowy 112."
-)
+_DISCLAIMER = DISCLAIMER_CLINICAL
+_PATIENT_DISCLAIMER = DISCLAIMER_PATIENT
 
 
 # ---------------------------------------------------------------------------

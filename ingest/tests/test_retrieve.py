@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from main import _SNIPPET_LEN, _format_rag_context, _retrieve_context
+from constants import SNIPPET_LEN as _SNIPPET_LEN
+from main import _format_rag_context, _retrieve_context
 
 # ---------------------------------------------------------------------------
 # _format_rag_context — unit tests (pure function, no I/O)

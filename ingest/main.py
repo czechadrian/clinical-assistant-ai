@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import httpx
@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from classifier import ClassifiedInput, classify_input  # noqa: F401
+from constants import DISCLAIMER_CLINICAL, SNIPPET_LEN
 from embedder import OpenAIEmbedder
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from router import RouterDecision, route
@@ -361,6 +362,29 @@ async def _db_rpc(function_name: str, params: dict, jwt: str) -> list[dict]:
     return response.json()
 
 
+async def _db_patch_service_role(table: str, filter_params: dict, data: dict) -> None:
+    """PATCH rows using the service role key, bypassing PostgREST RLS.
+
+    Only for admin operations that the user JWT cannot perform (e.g. resetting
+    doc status).  Reuses the shared _db_client connection pool — no new TCP
+    connections opened per call.
+    """
+    resp = await _retrying_request(
+        lambda: _db_client.patch(
+            f"/{table}",
+            params=filter_params,
+            json=data,
+            headers={
+                # Override only Authorization; apikey + Content-Type come from
+                # _db_client's default headers.
+                "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                "Prefer": "return=minimal",
+            },
+        )
+    )
+    resp.raise_for_status()
+
+
 async def _retrieve_context(query: str, top_k: int, jwt: str) -> list[dict]:
     """Return the top-k closest doc_chunks for *query*.
 
@@ -613,11 +637,6 @@ def _has_guideline_language(text: str) -> bool:
 # Replace with a real Claude call (using SYSTEM_PROMPT) in the next sprint.
 # ---------------------------------------------------------------------------
 
-_DISCLAIMER = (
-    "Asystent AI nie zastepuje porady lekarskiej ani decyzji klinicznej. "
-    "Zawsze konsultuj sie z wykwalifikowanym specjalista."
-)
-
 
 def _dispatch_workflow(
     workflow: str, classified: ClassifiedInput, rag_context: str = ""
@@ -655,7 +674,7 @@ def _build_refuse_payload() -> AssistantPayload:
         patient_facing_summary="",
         sources=[],
         flag="refuse",
-        disclaimer=_DISCLAIMER,
+        disclaimer=DISCLAIMER_CLINICAL,
     )
 
 
@@ -674,7 +693,7 @@ def _build_uncertain_payload() -> AssistantPayload:
         patient_facing_summary="",
         sources=[],
         flag="uncertain",
-        disclaimer=_DISCLAIMER,
+        disclaimer=DISCLAIMER_CLINICAL,
     )
 
 
@@ -701,7 +720,7 @@ def _build_no_source_payload() -> AssistantPayload:
         ),
         sources=[],
         flag="uncertain",
-        disclaimer=_DISCLAIMER,
+        disclaimer=DISCLAIMER_CLINICAL,
     )
 
 
@@ -754,6 +773,259 @@ async def _mock_sse_stream(payload: AssistantPayload, request_id: str):
         await asyncio.sleep(0.02)
     yield (
         f"data: {_json.dumps({'type': 'done', 'request_id': request_id, 'payload': payload.model_dump()})}\n\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat pipeline
+#
+# _execute_chat_pipeline contains all shared logic between /chat and
+# /chat/stream: classify → safety → conversation ownership → idempotency →
+# route → retrieve → dispatch → validate/repair → groundedness.
+#
+# Both handlers call this function, then differ only in how they persist
+# messages and what response type they return.  This prevents any safety or
+# routing change from being applied in one handler but forgotten in the other.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PipelineResult:
+    """Return value of _execute_chat_pipeline.
+
+    is_replay=True  → idempotency hit; replay_meta contains the stored _meta
+                      dict.  Caller must NOT insert DB messages.
+    is_replay=False → normal path; caller inserts user + assistant messages.
+    """
+
+    payload: AssistantPayload
+    classified: ClassifiedInput
+    decision: RouterDecision
+    repair_applied: bool
+    high_confidence: list[dict]
+    is_replay: bool = False
+    replay_meta: dict = field(default_factory=dict)
+
+
+async def _execute_chat_pipeline(
+    body: "ChatRequest",
+    auth: "Auth",
+    request_id: str,
+    idempotency_key: str | None,
+) -> _PipelineResult:
+    """Shared pipeline for /chat and /chat/stream.
+
+    Raises AppError on any failure (PII, mock disabled, conversation not found,
+    validation failed).  On idempotency hit, returns result.is_replay=True with
+    result.replay_meta populated; caller skips DB inserts.
+    """
+    user_id = auth.user_id
+
+    # 0. Classify input — single pass over all checks.
+    classified = classify_input(body.input_text)
+
+    # 0a. PII — abort before any DB write.
+    if classified.pii_flags:
+        logger.warning(
+            "pii_rejected",
+            extra={"request_id": request_id, "pii_type": classified.pii_flags[0]},
+        )
+        raise AppError(
+            "PII_DETECTED",
+            f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
+            "Please remove personal identifiers before submitting.",
+            status.HTTP_400_BAD_REQUEST,
+            request_id,
+        )
+
+    # 0b. Injection detected — log and continue (non-blocking).
+    if classified.has_injection:
+        logger.warning(
+            "injection_detected",
+            extra={
+                "request_id": request_id,
+                "injection_flags": classified.injection_flags,
+            },
+        )
+
+    # 0c. Feature flag.
+    if not settings.chat_mock_mode:
+        raise AppError(
+            "MOCK_DISABLED",
+            "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
+            status.HTTP_501_NOT_IMPLEMENTED,
+            request_id,
+        )
+
+    # 1. Verify conversation ownership.
+    conv_rows = await _db_select(
+        "/conversations",
+        {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
+        auth.jwt,
+    )
+    if not conv_rows:
+        raise AppError(
+            "CONVERSATION_NOT_FOUND",
+            "Conversation not found or access denied.",
+            status.HTTP_403_FORBIDDEN,
+            request_id,
+        )
+
+    # 1a. Idempotency check — before any writes.
+    if idempotency_key:
+        cached_rows = await _db_select(
+            "/messages",
+            {
+                "conversation_id": f"eq.{body.conversation_id}",
+                "role": "eq.assistant",
+                "content->_meta->>idempotency_key": f"eq.{idempotency_key}",
+                "select": "id,content",
+            },
+            auth.jwt,
+        )
+        if cached_rows:
+            content = cached_rows[0]["content"]
+            meta = content.get("_meta", {})
+            cached_payload = AssistantPayload.model_validate(
+                {k: v for k, v in content.items() if k != "_meta"}
+            )
+            logger.info(
+                "idempotent_replay",
+                extra={"request_id": request_id, "idempotency_key": idempotency_key},
+            )
+            # Synthesise a RouterDecision so the finally log in /chat has valid values.
+            _replay_decision = RouterDecision(
+                workflow=meta.get("workflow_name", body.mode),
+                reason=meta.get("router_reason", f"mode_{body.mode}"),
+            )
+            return _PipelineResult(
+                payload=cached_payload,
+                classified=classified,
+                decision=_replay_decision,
+                repair_applied=False,
+                high_confidence=[],
+                is_replay=True,
+                replay_meta=meta,
+            )
+
+    # 2. Route request to the appropriate workflow.
+    decision = route(body.mode, body.input_text)
+    logger.info(
+        "workflow_routed",
+        extra={
+            "request_id": request_id,
+            "workflow": decision.workflow,
+            "router_reason": decision.reason,
+        },
+    )
+
+    # 3. Insert user message — include classification + routing metadata.
+    # Persisted here (before dispatch/validation) so the user's intent is always
+    # recorded even if validation fails later.  _meta stores flag labels and a
+    # content-hash for audit; never stores raw flagged substrings or patient text.
+    user_meta: dict[str, Any] = {
+        "input_hash": classified.input_hash,
+        "injection_flags": classified.injection_flags,
+        "is_vague": classified.is_vague,
+        "is_unsafe_request": classified.is_unsafe_request,
+        "prompt_version": PROMPT_VERSION,
+        "workflow_name": decision.workflow,
+        "router_reason": decision.reason,
+    }
+    if idempotency_key:
+        user_meta["idempotency_key"] = idempotency_key
+
+    await _db_insert(
+        "messages",
+        {
+            "conversation_id": body.conversation_id,
+            "role": "user",
+            "content": {
+                "text": body.input_text,
+                "mode": body.mode,
+                "_meta": user_meta,
+            },
+            "user_id": user_id,
+        },
+        auth.jwt,
+    )
+
+    # 4. Retrieve context — non-blocking, degrades to [] on any failure.
+    retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
+    high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
+    rag_context = _format_rag_context(high_confidence)
+
+    # 5. Build raw payload dict.
+    if classified.is_unsafe_request:
+        logger.warning("unsafe_request_refused", extra={"request_id": request_id})
+        raw_dict = _build_refuse_payload().model_dump()
+    elif classified.is_vague:
+        logger.info("vague_input_uncertain", extra={"request_id": request_id})
+        raw_dict = _build_uncertain_payload().model_dump()
+    else:
+        raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
+
+    # 4a. Inject sources — chunk_id + snippet, only from actual retrieval.
+    if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
+        raw_dict["sources"] = [
+            {
+                "id": str(r["chunk_id"]),
+                "title": r["title"],
+                "section": r.get("section") or "",
+                "text_snippet": r["content"][:SNIPPET_LEN],
+            }
+            for r in high_confidence
+        ]
+
+    # 5. Validate — repair once if needed — validate again.
+    try:
+        payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
+    except ValidationError as exc:
+        logger.error(
+            "payload_validation_failed",
+            extra={
+                "request_id": request_id,
+                "validation_error_code": "schema_invalid_after_repair",
+                "error_count": exc.error_count(),
+            },
+        )
+        safe_detail = "Assistant response did not meet the required schema. Please retry."
+        if settings.validation_debug:
+            error_locs = [
+                f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}" for e in exc.errors()
+            ]
+            safe_detail = f"{safe_detail} [debug] Invalid fields: {error_locs}"
+        raise AppError(
+            "VALIDATION_FAILED",
+            safe_detail,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            request_id,
+        ) from None
+
+    if repair_applied:
+        logger.warning("payload_repaired", extra={"request_id": request_id})
+
+    # 6. Groundedness enforcement.
+    if (
+        not high_confidence
+        and not classified.is_unsafe_request
+        and not classified.is_vague
+        and decision.workflow in _REQUIRES_SOURCES
+    ):
+        logger.info(
+            "no_source_fallback",
+            extra={"request_id": request_id, "workflow": decision.workflow},
+        )
+        payload = _build_no_source_payload()
+    else:
+        payload = _check_groundedness(payload, high_confidence)
+
+    return _PipelineResult(
+        payload=payload,
+        classified=classified,
+        decision=decision,
+        repair_applied=repair_applied,
+        high_confidence=high_confidence,
     )
 
 
@@ -845,10 +1117,7 @@ async def chat(
     user_id = auth.user_id
     input_length = len(body.input_text)
     status_code = 200
-    classified: ClassifiedInput | None = None  # set in try block; read safely in finally
-    decision: RouterDecision | None = None  # set after route(); None on early exits
-    retrieved: list[dict] = []  # set in try block; count logged in finally
-    high_confidence: list[dict] = []  # filtered subset of retrieved above threshold
+    result: _PipelineResult | None = None  # set in try block; read safely in finally
 
     # Logged on arrival — never includes raw content.
     logger.info(
@@ -863,233 +1132,35 @@ async def chat(
     )
 
     try:
-        # 0. Classify input — single pass over all checks -------------------
-        # Returns a typed object; raw body.input_text is never read again.
-        classified = classify_input(body.input_text)
+        result = await _execute_chat_pipeline(body, auth, request_id, idempotency_key)
 
-        # 0a. PII — abort before any DB write --------------------------------
-        if classified.pii_flags:
-            logger.warning(
-                "pii_rejected",
-                extra={"request_id": request_id, "pii_type": classified.pii_flags[0]},
-            )
-            raise AppError(
-                "PII_DETECTED",
-                f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
-                "Please remove personal identifiers before submitting.",
-                status.HTTP_400_BAD_REQUEST,
-                request_id,
-            )
-
-        # 0b. Injection detected — log and continue (non-blocking) ----------
-        if classified.has_injection:
-            logger.warning(
-                "injection_detected",
-                extra={
-                    "request_id": request_id,
-                    "injection_flags": classified.injection_flags,
-                },
+        # Idempotency replay — skip DB writes, reconstruct response from stored meta.
+        if result.is_replay:
+            meta = result.replay_meta
+            return ChatResponse(
+                request_id=request_id,
+                assistant_payload=result.payload,
+                response_metadata=ResponseMetadata(
+                    is_mock=meta.get("is_mock", True),
+                    model=meta.get("model", "mock-v1"),
+                    prompt_version=meta.get("prompt_version", PROMPT_VERSION),
+                    workflow=meta.get("workflow_name", body.mode),
+                    router_reason=meta.get("router_reason", f"mode_{body.mode}"),
+                ),
             )
 
-        # 0.5 Feature flag ---------------------------------------------------
-        if not settings.chat_mock_mode:
-            raise AppError(
-                "MOCK_DISABLED",
-                "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
-                status.HTTP_501_NOT_IMPLEMENTED,
-                request_id,
-            )
+        decision = result.decision
+        payload = result.payload
 
-        # 1. Verify conversation ownership -----------------------------------
-        conv_rows = await _db_select(
-            "/conversations",
-            {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
-            auth.jwt,
-        )
-        if not conv_rows:
-            raise AppError(
-                "CONVERSATION_NOT_FOUND",
-                "Conversation not found or access denied.",
-                status.HTTP_403_FORBIDDEN,
-                request_id,
-            )
-
-        # 1a. Idempotency check — before any writes --------------------------
-        # If the client sent a key we've already processed, return the cached
-        # assistant response without inserting any new rows.
-        if idempotency_key:
-            cached_rows = await _db_select(
-                "/messages",
-                {
-                    "conversation_id": f"eq.{body.conversation_id}",
-                    "role": "eq.assistant",
-                    "content->_meta->>idempotency_key": f"eq.{idempotency_key}",
-                    "select": "id,content",
-                },
-                auth.jwt,
-            )
-            if cached_rows:
-                content = cached_rows[0]["content"]
-                meta = content.get("_meta", {})
-                cached_payload = AssistantPayload.model_validate(
-                    {k: v for k, v in content.items() if k != "_meta"}
-                )
-                logger.info(
-                    "idempotent_replay",
-                    extra={"request_id": request_id, "idempotency_key": idempotency_key},
-                )
-                return ChatResponse(
-                    request_id=request_id,
-                    assistant_payload=cached_payload,
-                    response_metadata=ResponseMetadata(
-                        is_mock=meta.get("is_mock", True),
-                        model=meta.get("model", "mock-v1"),
-                        prompt_version=meta.get("prompt_version", PROMPT_VERSION),
-                        workflow=meta.get("workflow_name", body.mode),
-                        router_reason=meta.get("router_reason", f"mode_{body.mode}"),
-                    ),
-                )
-
-        # 2. Route request to the appropriate workflow -------------------------
-        # Runs after safety checks but before any DB writes so router_reason
-        # is available for both user and assistant message metadata.
-        decision = route(body.mode, body.input_text)
-        logger.info(
-            "workflow_routed",
-            extra={
-                "request_id": request_id,
-                "workflow": decision.workflow,
-                "router_reason": decision.reason,
-            },
-        )
-
-        # 3. Insert user message — include classification + routing metadata --
-        # _meta stores flag labels and a content-hash for audit.
-        # It never stores raw flagged substrings or patient text.
-        user_meta: dict[str, Any] = {
-            "input_hash": classified.input_hash,
-            "injection_flags": classified.injection_flags,
-            "is_vague": classified.is_vague,
-            "is_unsafe_request": classified.is_unsafe_request,
-            "prompt_version": PROMPT_VERSION,
-            "workflow_name": decision.workflow,
-            "router_reason": decision.reason,
-        }
-        if idempotency_key:
-            user_meta["idempotency_key"] = idempotency_key
-
-        await _db_insert(
-            "messages",
-            {
-                "conversation_id": body.conversation_id,
-                "role": "user",
-                "content": {
-                    "text": body.input_text,
-                    "mode": body.mode,
-                    "_meta": user_meta,
-                },
-                "user_id": user_id,
-            },
-            auth.jwt,
-        )
-
-        # 4. Retrieve context — non-blocking, degrades to [] on any failure ---
-        # Privacy: chunk content and query text are never logged (only counts).
-        retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
-        # Only chunks above the confidence threshold are used for grounding.
-        high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
-        rag_context = _format_rag_context(high_confidence)
-
-        # 5. Build raw payload dict -------------------------------------------
-        # Safety gates are checked first (short-circuit); normal path dispatches
-        # to the workflow function selected by the router.
-        if classified.is_unsafe_request:
-            logger.warning("unsafe_request_refused", extra={"request_id": request_id})
-            raw_dict = _build_refuse_payload().model_dump()
-        elif classified.is_vague:
-            logger.info("vague_input_uncertain", extra={"request_id": request_id})
-            raw_dict = _build_uncertain_payload().model_dump()
-        else:
-            raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
-
-        # 5a. Inject sources — chunk_id + snippet, only from actual retrieval.
-        # Never invented.  text_snippet is truncated to _SNIPPET_LEN for the
-        # UI debug toggle; it is not logged.
-        if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
-            raw_dict["sources"] = [
-                {
-                    "id": str(r["chunk_id"]),
-                    "title": r["title"],
-                    "section": r.get("section") or "",
-                    "text_snippet": r["content"][:_SNIPPET_LEN],
-                }
-                for r in high_confidence
-            ]
-
-        # 4. Validate — repair once if needed — validate again ----------------
-        # On success: payload is a valid AssistantPayload; repair_applied records whether
-        # coercions were needed.  On failure: 500 with a safe message (no raw content).
-        try:
-            payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
-        except ValidationError as exc:
-            logger.error(
-                "payload_validation_failed",
-                extra={
-                    "request_id": request_id,
-                    "validation_error_code": "schema_invalid_after_repair",
-                    # error_count is a safe integer; field paths omitted (could hint at content)
-                    "error_count": exc.error_count(),
-                },
-            )
-            safe_detail = "Assistant response did not meet the required schema. Please retry."
-            if settings.validation_debug:
-                # Field paths + error types only — never the raw invalid values.
-                error_locs = [
-                    f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}" for e in exc.errors()
-                ]
-                safe_detail = f"{safe_detail} [debug] Invalid fields: {error_locs}"
-            raise AppError(
-                "VALIDATION_FAILED",
-                safe_detail,
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-                request_id,
-            ) from None
-
-        if repair_applied:
-            logger.warning("payload_repaired", extra={"request_id": request_id})
-
-        # 6a. Groundedness enforcement ----------------------------------------
-        # No-source fallback: for workflows that require retrieved sources
-        # (_REQUIRES_SOURCES), a non-vague non-unsafe query with no high-confidence
-        # chunks returns the explicit "no supporting documents" uncertain payload.
-        # doc_qa contractually requires sources; triage benefits from guideline context.
-        # summary and patient_message operate on provided note text — sources are
-        # optional enrichment so they fall through to _check_groundedness.
-        if (
-            not high_confidence
-            and not classified.is_unsafe_request
-            and not classified.is_vague
-            and decision.workflow in _REQUIRES_SOURCES
-        ):
-            logger.info(
-                "no_source_fallback",
-                extra={"request_id": request_id, "workflow": decision.workflow},
-            )
-            payload = _build_no_source_payload()
-        else:
-            # Post-check: if sources[] empty but response contains specific guideline
-            # language (dosages, org refs), downgrade to uncertain.  Safety net for
-            # cases where the LLM generates confident claims without retrieved backing.
-            payload = _check_groundedness(payload, high_confidence)
-
-        # 7. Insert assistant message — validation must pass before storage ---
+        # Insert assistant message — validation must pass before storage.
         # Raw invalid output is never stored; only the repaired-and-validated payload.
+        # (User message was already inserted inside _execute_chat_pipeline.)
         assistant_meta: dict[str, Any] = {
             "prompt_version": PROMPT_VERSION,
             "model": "mock-v1",
             "is_mock": True,
             "validation_status": "valid",
-            "repair_applied": repair_applied,
+            "repair_applied": result.repair_applied,
             "workflow_name": decision.workflow,
             "router_reason": decision.reason,
         }
@@ -1150,11 +1221,11 @@ async def chat(
                 "is_mock": settings.chat_mock_mode,
                 "prompt_version": PROMPT_VERSION,
                 # router metadata — safe strings, no user content
-                "workflow": decision.workflow if decision else "unrouted",
-                "router_reason": decision.reason if decision else "none",
+                "workflow": result.decision.workflow if result else "unrouted",
+                "router_reason": result.decision.reason if result else "none",
                 # counts only — never raw content
-                "injection_flag_count": len(classified.injection_flags) if classified else 0,
-                "retrieved_count": len(high_confidence),
+                "injection_flag_count": len(result.classified.injection_flags) if result else 0,
+                "retrieved_count": len(result.high_confidence) if result else 0,
             },
         )
 
@@ -1168,156 +1239,35 @@ async def chat_stream(
     """SSE variant of /chat.  Streams delta tokens then a 'done' event.
 
     Persists ONE complete assistant message after payload is determined.
-    In Week 2: replace _build_raw_payload with a real LLM streaming call and
+    In Week 2: replace _mock_sse_stream with a real LLM streaming call and
     yield tokens as they arrive; store the message in a background task after
     the stream closes.
     """
     request_id = str(uuid.uuid4())
     user_id = auth.user_id
 
-    classified = classify_input(body.input_text)
+    result = await _execute_chat_pipeline(body, auth, request_id, idempotency_key)
 
-    if classified.pii_flags:
-        raise AppError(
-            "PII_DETECTED",
-            f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
-            "Please remove personal identifiers before submitting.",
-            status.HTTP_400_BAD_REQUEST,
-            request_id,
-        )
-    if classified.has_injection:
-        logger.warning(
-            "injection_detected",
-            extra={"request_id": request_id, "injection_flags": classified.injection_flags},
-        )
-    if not settings.chat_mock_mode:
-        raise AppError(
-            "MOCK_DISABLED",
-            "LLM integration not yet enabled. Set CHAT_MOCK_MODE=true to use mock responses.",
-            status.HTTP_501_NOT_IMPLEMENTED,
-            request_id,
+    # Idempotency replay — stream the cached payload without any DB writes.
+    if result.is_replay:
+        return StreamingResponse(
+            _mock_sse_stream(result.payload, request_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
         )
 
-    conv_rows = await _db_select(
-        "/conversations",
-        {"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id"},
-        auth.jwt,
-    )
-    if not conv_rows:
-        raise AppError(
-            "CONVERSATION_NOT_FOUND",
-            "Conversation not found or access denied.",
-            status.HTTP_403_FORBIDDEN,
-            request_id,
-        )
-
-    # Idempotency: return cached stream if this key was already processed.
-    if idempotency_key:
-        cached_rows = await _db_select(
-            "/messages",
-            {
-                "conversation_id": f"eq.{body.conversation_id}",
-                "role": "eq.assistant",
-                "content->_meta->>idempotency_key": f"eq.{idempotency_key}",
-                "select": "id,content",
-            },
-            auth.jwt,
-        )
-        if cached_rows:
-            content = cached_rows[0]["content"]
-            cached_payload = AssistantPayload.model_validate(
-                {k: v for k, v in content.items() if k != "_meta"}
-            )
-            logger.info(
-                "idempotent_stream_replay",
-                extra={"request_id": request_id, "idempotency_key": idempotency_key},
-            )
-            return StreamingResponse(
-                _mock_sse_stream(cached_payload, request_id),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
-            )
-
-    # Route, retrieve, and build payload (mirrors /chat logic).
-    decision = route(body.mode, body.input_text)
-
-    retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
-    high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
-    rag_context = _format_rag_context(high_confidence)
-
-    if classified.is_unsafe_request:
-        raw_dict = _build_refuse_payload().model_dump()
-    elif classified.is_vague:
-        raw_dict = _build_uncertain_payload().model_dump()
-    else:
-        raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
-
-    if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
-        raw_dict["sources"] = [
-            {
-                "id": str(r["chunk_id"]),
-                "title": r["title"],
-                "section": r.get("section") or "",
-                "text_snippet": r["content"][:_SNIPPET_LEN],
-            }
-            for r in high_confidence
-        ]
-
-    try:
-        payload, repair_applied = validate_and_repair(raw_dict, AssistantPayload)
-    except ValidationError as exc:
-        logger.error(
-            "payload_validation_failed",
-            extra={"request_id": request_id, "error_count": exc.error_count()},
-        )
-        raise AppError(
-            "VALIDATION_FAILED",
-            "Assistant response did not meet the required schema. Please retry.",
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            request_id,
-        ) from None
-
-    if (
-        not high_confidence
-        and not classified.is_unsafe_request
-        and not classified.is_vague
-        and decision.workflow in _REQUIRES_SOURCES
-    ):
-        payload = _build_no_source_payload()
-    else:
-        payload = _check_groundedness(payload, high_confidence)
-
-    # Persist user message.
-    user_meta: dict[str, Any] = {
-        "input_hash": classified.input_hash,
-        "injection_flags": classified.injection_flags,
-        "is_vague": classified.is_vague,
-        "is_unsafe_request": classified.is_unsafe_request,
-        "prompt_version": PROMPT_VERSION,
-        "workflow_name": decision.workflow,
-        "router_reason": decision.reason,
-    }
-    if idempotency_key:
-        user_meta["idempotency_key"] = idempotency_key
-    await _db_insert(
-        "messages",
-        {
-            "conversation_id": body.conversation_id,
-            "role": "user",
-            "content": {"text": body.input_text, "mode": body.mode, "_meta": user_meta},
-            "user_id": user_id,
-        },
-        auth.jwt,
-    )
+    decision = result.decision
+    payload = result.payload
 
     # Persist the complete assistant message before streaming begins.
+    # (User message was already inserted inside _execute_chat_pipeline.)
     # (In mock mode the payload is fully determined; Week 2 uses a background task.)
     assistant_meta: dict[str, Any] = {
         "prompt_version": PROMPT_VERSION,
         "model": "mock-v1",
         "is_mock": True,
         "validation_status": "valid",
-        "repair_applied": repair_applied,
+        "repair_applied": result.repair_applied,
         "workflow_name": decision.workflow,
         "router_reason": decision.reason,
     }
@@ -1493,28 +1443,15 @@ async def reset_stuck_docs(
     if not stuck:
         return IngestTriggerResponse(queued=0, message="No stuck documents found.")
 
-    # Patch each stuck document back to pending using service role
-    # (user JWT cannot update docs to arbitrary states without going through
-    # the admin-only UPDATE policy; service role bypasses RLS).
-    import httpx as _httpx
-
-    service_headers = {
-        "apikey": settings.supabase_service_role_key,
-        "Authorization": f"Bearer {settings.supabase_service_role_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-    async with _httpx.AsyncClient(
-        base_url=f"{settings.supabase_url}/rest/v1",
-        timeout=_TIMEOUT,
-    ) as svc:
-        resp = await svc.patch(
-            "/docs",
-            params={"status": "eq.processing"},
-            json={"status": "pending"},
-            headers=service_headers,
-        )
-        resp.raise_for_status()
+    # Patch each stuck document back to pending using the service role key.
+    # The user JWT cannot UPDATE docs to arbitrary statuses via the RLS policy;
+    # _db_patch_service_role bypasses RLS using the service role key while
+    # still reusing the shared _db_client connection pool.
+    await _db_patch_service_role(
+        "docs",
+        {"status": "eq.processing"},
+        {"status": "pending"},
+    )
 
     count = len(stuck)
     logger.info("reset_stuck_docs", extra={"count": count, "user_id": auth.user_id})
@@ -1547,8 +1484,6 @@ async def ingest_status(
 # ---------------------------------------------------------------------------
 # Retrieval endpoint (Day 16 — contract only; vector search added Day 18)
 # ---------------------------------------------------------------------------
-
-_SNIPPET_LEN = 300  # characters shown in text_snippet; tune when real chunks exist
 
 
 @app.get("/retrieve", response_model=RetrieveResponse)
@@ -1593,7 +1528,7 @@ async def retrieve(
             section=r.get("section"),
             score=float(r["score"]),
             # text_snippet is a display excerpt; full content stays server-side.
-            text_snippet=r["content"][:_SNIPPET_LEN],
+            text_snippet=r["content"][:SNIPPET_LEN],
         )
         for r in rows
     ]

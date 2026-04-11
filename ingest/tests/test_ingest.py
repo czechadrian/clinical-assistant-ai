@@ -225,16 +225,8 @@ def test_reset_stuck_200_none_stuck(client):
 def test_reset_stuck_patches_processing_docs(client):
     with (
         patch("main._db_select", side_effect=_make_select_mock(processing=_DOC_PROCESSING)),
-        patch("httpx.AsyncClient") as MockClient,
+        patch("main._db_patch_service_role", new=AsyncMock()),
     ):
-        mock_resp = MagicMock()
-        mock_resp.raise_for_status = MagicMock()
-        mock_svc = AsyncMock()
-        mock_svc.__aenter__ = AsyncMock(return_value=mock_svc)
-        mock_svc.__aexit__ = AsyncMock(return_value=False)
-        mock_svc.patch = AsyncMock(return_value=mock_resp)
-        MockClient.return_value = mock_svc
-
         resp = client.post("/admin/ingest/reset-stuck")
 
     assert resp.status_code == 200

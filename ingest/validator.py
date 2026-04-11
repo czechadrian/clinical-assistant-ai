@@ -19,14 +19,11 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from constants import DISCLAIMER_CLINICAL
+
 T = TypeVar("T", bound=BaseModel)
 
-# Fallback strings for repair.  Keep in sync with _DISCLAIMER in main.py until
-# a shared constants module exists.
-_FALLBACK_DISCLAIMER = (
-    "Asystent AI nie zastepuje porady lekarskiej ani decyzji klinicznej. "
-    "Zawsze konsultuj sie z wykwalifikowanym specjalista."
-)
+_FALLBACK_DISCLAIMER = DISCLAIMER_CLINICAL
 _FALLBACK_SUMMARY = "Informacje o wizycie zostały przetworzone przez system."
 _MAX_STR_LEN = 2000
 
