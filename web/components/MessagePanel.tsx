@@ -74,6 +74,10 @@ function AssistantBubble({ content }: { content: unknown }) {
     : undefined;
   const workflowName = meta?.workflow_name as string | undefined;
   const routerReason = meta?.router_reason as string | undefined;
+  // [optional debug] Tool metadata — Day 23. IDs only; never snippet content.
+  const toolUsed = meta?.tool_used as boolean | undefined;
+  const toolName = meta?.tool_name as string | undefined;
+  const retrievedIds = meta?.retrieved_chunk_ids as string[] | undefined;
 
   return (
     <div className="space-y-3 text-sm">
@@ -90,6 +94,16 @@ function AssistantBubble({ content }: { content: unknown }) {
           {workflowName}
           {routerReason && routerReason !== `mode_${workflowName}` && (
             <span className="text-slate-400"> · {routerReason}</span>
+          )}
+        </span>
+      )}
+
+      {/* [optional] Tool debug badge — dev only. Shows tool name + retrieved IDs. */}
+      {IS_DEV && toolUsed && (
+        <span className="ml-2 inline-block rounded border border-violet-200 bg-violet-50 px-1.5 py-0.5 font-mono text-xs text-violet-600 dark:border-violet-800 dark:bg-violet-950/30 dark:text-violet-400">
+          🔍 {toolName ?? "tool"}
+          {retrievedIds && retrievedIds.length > 0 && (
+            <span className="text-violet-400"> · {retrievedIds.length} chunk{retrievedIds.length !== 1 ? "s" : ""}</span>
           )}
         </span>
       )}

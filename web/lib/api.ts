@@ -201,8 +201,12 @@ export type ResponseMetadata = {
   is_mock: boolean;
   model: string;
   prompt_version: string;
-  workflow: string;       // which workflow pipeline generated this response
-  router_reason: string;  // why the router chose this workflow (safe string, no user content)
+  workflow: string;             // which workflow pipeline generated this response
+  router_reason: string;        // why the router chose this workflow (safe string, no user content)
+  // Tool metadata (Day 23) — IDs only, never snippet content
+  tool_used: boolean;
+  tool_name: string | null;
+  retrieved_chunk_ids: string[];
 };
 
 export type ChatApiResponse = {

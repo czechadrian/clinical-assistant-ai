@@ -24,6 +24,8 @@ from embedder import OpenAIEmbedder
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from router import RouterDecision, route
 from settings import Settings, configure_logging
+from tools import guidelines_search
+from tools.guidelines_search import GuidelinesSearchInput, GuidelinesSearchOutput
 from validator import validate_and_repair
 from workflows import run_doc_qa, run_patient_message, run_summary, run_triage
 
@@ -532,6 +534,10 @@ class ResponseMetadata(BaseModel):
     prompt_version: str  # matches policy.PROMPT_VERSION
     workflow: str = "triage"  # workflow that generated this response
     router_reason: str = "mode_triage"  # why the router chose this workflow
+    # Tool metadata (Day 23) — IDs only, never snippet content
+    tool_used: bool = False
+    tool_name: str | None = None
+    retrieved_chunk_ids: list[str] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -609,6 +615,65 @@ class RetrieveResponse(BaseModel):
 
 _MIN_RETRIEVAL_SCORE = 0.5
 
+# ---------------------------------------------------------------------------
+# Tool-use gate
+#
+# _GUIDELINE_QUERY_RE — detects when a triage query explicitly asks for
+#   guideline-based reasoning. Matches Polish and English references.
+#   Pattern is intentionally broad: false positives are safe (extra retrieval),
+#   false negatives silently skip the tool (triage still returns a valid payload).
+#
+# _should_use_tool — deterministic, pure function, no I/O.
+#   doc_qa:           always uses GuidelinesSearch.
+#   triage:           uses it only when the user explicitly references guidelines.
+#   summary / patient_message: never use the tool.
+#
+# _run_guidelines_search — wires live singletons into the injected-dep tool.
+#   Returns empty output when _embedder is not configured.
+#   Exceptions propagate to the caller, which logs and falls back to empty.
+# ---------------------------------------------------------------------------
+
+_GUIDELINE_QUERY_RE = re.compile(
+    r"\b("
+    r"na\s+podstawie\s+wytyczn\w*"
+    r"|zgodnie\s+z\s+wytyczn\w*"
+    r"|wytyczn\w+\s+\w+"  # "wytyczne PTK", "wytyczne kliniczne", etc.
+    r"|based\s+on\s+(the\s+)?guidelines?"
+    r"|according\s+to\s+(the\s+)?guidelines?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _should_use_tool(workflow: str, input_text: str) -> bool:
+    """Return True when GuidelinesSearch should run for this (workflow, input) pair.
+
+    Deterministic — no I/O, no side effects. Safe to call in tests directly.
+    """
+    if workflow == "doc_qa":
+        return True
+    if workflow == "triage":
+        return bool(_GUIDELINE_QUERY_RE.search(input_text))
+    return False  # summary, patient_message
+
+
+async def _run_guidelines_search(query: str, jwt: str, top_k: int = 3) -> GuidelinesSearchOutput:
+    """Call the GuidelinesSearch tool with live singleton dependencies.
+
+    Returns empty output when _embedder is not configured so the pipeline
+    degrades gracefully (same pattern as _retrieve_context).
+    """
+    if _embedder is None:
+        return GuidelinesSearchOutput(items=[])
+    tool_input = GuidelinesSearchInput(query=query, top_k=top_k)
+    return await guidelines_search.run(
+        tool_input,
+        embedder_embed=_embedder.embed,
+        db_rpc=_db_rpc,
+        jwt=jwt,
+    )
+
+
 _GUIDELINE_LANGUAGE_RE = re.compile(
     r"\b("
     r"wytyczn\w+\s+(?:PTK|ESC|WHO|PTD|AHA|ACC|ERS|EAN)\b"
@@ -656,13 +721,6 @@ def _dispatch_workflow(
     if workflow == "doc_qa":
         return run_doc_qa(classified, rag_context)
     return run_triage(classified, rag_context)  # default: triage
-
-
-# Workflows that require retrieved sources to produce a trustworthy response.
-# When high_confidence=[] for these workflows, the no-source fallback fires.
-# summary and patient_message operate on the clinician's provided note text;
-# sources are optional enrichment, not a hard requirement.
-_REQUIRES_SOURCES = frozenset({"triage", "doc_qa"})
 
 
 def _build_refuse_payload() -> AssistantPayload:
@@ -805,6 +863,12 @@ class _PipelineResult:
     high_confidence: list[dict]
     is_replay: bool = False
     replay_meta: dict = field(default_factory=dict)
+    # Tool metadata — stored in message._meta, surfaced in ResponseMetadata.
+    # IDs only: never include query text or snippet content here.
+    tool_used: bool = False
+    tool_name: str | None = None
+    tool_query_hash: str | None = None
+    retrieved_chunk_ids: list[str] = field(default_factory=list)
 
 
 async def _execute_chat_pipeline(
@@ -923,6 +987,14 @@ async def _execute_chat_pipeline(
     # Persisted here (before dispatch/validation) so the user's intent is always
     # recorded even if validation fails later.  _meta stores flag labels and a
     # content-hash for audit; never stores raw flagged substrings or patient text.
+    # Determine tool eligibility at routing time so it can be persisted in the
+    # user message _meta.  Skipped for unsafe/vague inputs (short-circuit in step 5).
+    tool_should_run = (
+        _should_use_tool(decision.workflow, body.input_text)
+        and not classified.is_unsafe_request
+        and not classified.is_vague
+    )
+
     user_meta: dict[str, Any] = {
         "input_hash": classified.input_hash,
         "injection_flags": classified.injection_flags,
@@ -931,6 +1003,7 @@ async def _execute_chat_pipeline(
         "prompt_version": PROMPT_VERSION,
         "workflow_name": decision.workflow,
         "router_reason": decision.reason,
+        "tool_expected": tool_should_run,
     }
     if idempotency_key:
         user_meta["idempotency_key"] = idempotency_key
@@ -950,10 +1023,54 @@ async def _execute_chat_pipeline(
         auth.jwt,
     )
 
-    # 4. Retrieve context — non-blocking, degrades to [] on any failure.
-    retrieved = await _retrieve_context(body.input_text, top_k=3, jwt=auth.jwt)
-    high_confidence = [r for r in retrieved if r.get("score", 0) >= _MIN_RETRIEVAL_SCORE]
-    rag_context = _format_rag_context(high_confidence)
+    # 4. Tool-gated retrieval via GuidelinesSearch.
+    #
+    # doc_qa:      always runs the tool.
+    # triage:      runs only when the user explicitly references guidelines.
+    # summary/patient_message: no retrieval.
+    #
+    # Failures degrade gracefully to empty output — the pipeline continues
+    # and the no-source fallback fires if tool_should_run but items=[].
+    tool_output: GuidelinesSearchOutput | None = None
+    high_confidence: list[dict] = []
+    rag_context = ""
+
+    if tool_should_run:
+        try:
+            tool_output = await _run_guidelines_search(body.input_text, auth.jwt)
+            # Map tool items to the dict format expected by _format_rag_context.
+            # content=item.snippet is sufficient for mock mode; Week 3 will use
+            # full chunk text from the DB for LLM context assembly.
+            high_confidence = [
+                {
+                    "chunk_id": item.chunk_id,
+                    "doc_id": item.doc_id,
+                    "title": item.title,
+                    "section": item.section,
+                    "content": item.snippet,
+                    "score": item.score,
+                }
+                for item in tool_output.items
+            ]
+            rag_context = _format_rag_context(high_confidence)
+            logger.info(
+                "tool_executed",
+                extra={
+                    "request_id": request_id,
+                    "tool_name": guidelines_search.TOOL_NAME,
+                    # query_hash instead of raw query — privacy-safe audit reference
+                    "tool_query_hash": guidelines_search.query_hash(body.input_text),
+                    # chunk_ids only — no snippet content in logs
+                    "retrieved_chunk_ids": [item.chunk_id for item in tool_output.items],
+                    "item_count": len(tool_output.items),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "tool_retrieval_skipped",
+                extra={"request_id": request_id, "reason": type(exc).__name__},
+            )
+            tool_output = GuidelinesSearchOutput(items=[])
 
     # 5. Build raw payload dict.
     if classified.is_unsafe_request:
@@ -1006,12 +1123,15 @@ async def _execute_chat_pipeline(
         logger.warning("payload_repaired", extra={"request_id": request_id})
 
     # 6. Groundedness enforcement.
-    if (
-        not high_confidence
-        and not classified.is_unsafe_request
-        and not classified.is_vague
-        and decision.workflow in _REQUIRES_SOURCES
-    ):
+    #
+    # No-source fallback: fires when the tool WAS supposed to run (doc_qa always;
+    # triage with explicit guideline reference) but returned zero items.
+    # Distinct from unsafe/vague paths which short-circuit before retrieval.
+    #
+    # For workflows where the tool was not triggered (summary, patient_message,
+    # triage without guideline language), high_confidence=[] is intentional and
+    # the fallback must NOT fire — those payloads stand without citations.
+    if tool_should_run and not high_confidence:
         logger.info(
             "no_source_fallback",
             extra={"request_id": request_id, "workflow": decision.workflow},
@@ -1020,12 +1140,22 @@ async def _execute_chat_pipeline(
     else:
         payload = _check_groundedness(payload, high_confidence)
 
+    # Resolve tool audit fields for _PipelineResult.
+    _tool_actually_used = tool_should_run and tool_output is not None
+    _retrieved_ids = [item.chunk_id for item in tool_output.items] if tool_output else []
+
     return _PipelineResult(
         payload=payload,
         classified=classified,
         decision=decision,
         repair_applied=repair_applied,
         high_confidence=high_confidence,
+        tool_used=_tool_actually_used,
+        tool_name=guidelines_search.TOOL_NAME if _tool_actually_used else None,
+        tool_query_hash=guidelines_search.query_hash(body.input_text)
+        if _tool_actually_used
+        else None,
+        retrieved_chunk_ids=_retrieved_ids,
     )
 
 
@@ -1163,6 +1293,11 @@ async def chat(
             "repair_applied": result.repair_applied,
             "workflow_name": decision.workflow,
             "router_reason": decision.reason,
+            # Tool audit fields — IDs only, never query text or snippet content
+            "tool_used": result.tool_used,
+            "tool_name": result.tool_name,
+            "tool_query_hash": result.tool_query_hash,
+            "retrieved_chunk_ids": result.retrieved_chunk_ids,
         }
         if idempotency_key:
             assistant_meta["idempotency_key"] = idempotency_key
@@ -1190,6 +1325,9 @@ async def chat(
                 prompt_version=PROMPT_VERSION,
                 workflow=decision.workflow,
                 router_reason=decision.reason,
+                tool_used=result.tool_used,
+                tool_name=result.tool_name,
+                retrieved_chunk_ids=result.retrieved_chunk_ids,
             ),
         )
 
@@ -1270,6 +1408,11 @@ async def chat_stream(
         "repair_applied": result.repair_applied,
         "workflow_name": decision.workflow,
         "router_reason": decision.reason,
+        # Tool audit fields — IDs only, never query text or snippet content
+        "tool_used": result.tool_used,
+        "tool_name": result.tool_name,
+        "tool_query_hash": result.tool_query_hash,
+        "retrieved_chunk_ids": result.retrieved_chunk_ids,
     }
     if idempotency_key:
         assistant_meta["idempotency_key"] = idempotency_key

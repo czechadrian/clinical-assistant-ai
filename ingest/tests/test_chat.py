@@ -137,11 +137,14 @@ def test_chat_200_uncertain_vague(client):
 
 
 def test_chat_no_retrieval_forces_uncertain(client):
-    """Non-vague, non-unsafe query with no retrieved chunks → no-source uncertain payload."""
+    """Triage without guideline language: tool is NOT used.
+    run_triage() returns flag='uncertain' by default — assertion still holds,
+    but the reason is the mock workflow default, not the no-source fallback.
+    """
     with (
         patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
         patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
-        # _embedder is None in tests → _retrieve_context returns [] automatically
+        # _embedder is None in tests; tool will not run (triage without guideline language)
     ):
         resp = client.post("/chat", json=VALID_BODY)
 
@@ -149,12 +152,14 @@ def test_chat_no_retrieval_forces_uncertain(client):
     payload = resp.json()["assistant_payload"]
     assert payload["flag"] == "uncertain"
     assert payload["sources"] == []
+    # Tool must NOT have been used for a plain triage query
+    assert resp.json()["response_metadata"]["tool_used"] is False
 
 
 @patch("main._embedder")
 @patch("main._db_rpc", new_callable=AsyncMock)
 def test_chat_retrieval_populates_sources(mock_rpc, mock_embedder, client):
-    """When retrieval returns high-confidence chunks, sources[] is populated with chunk_id."""
+    """doc_qa always uses GuidelinesSearch — sources[] is populated with chunk_id."""
     mock_embedder.embed = AsyncMock(return_value=[[0.1] * 1536])
     mock_rpc.return_value = [
         {
@@ -166,11 +171,12 @@ def test_chat_retrieval_populates_sources(mock_rpc, mock_embedder, client):
             "score": 0.91,
         }
     ]
+    doc_qa_body = {**VALID_BODY, "mode": "doc_qa", "input_text": "What is the treatment for STEMI?"}
     with (
         patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
         patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
     ):
-        resp = client.post("/chat", json=VALID_BODY)
+        resp = client.post("/chat", json=doc_qa_body)
 
     assert resp.status_code == 200
     sources = resp.json()["assistant_payload"]["sources"]
@@ -180,6 +186,8 @@ def test_chat_retrieval_populates_sources(mock_rpc, mock_embedder, client):
     assert sources[0]["section"] == "OZW"
     assert sources[0]["text_snippet"] is not None
     assert len(sources[0]["text_snippet"]) <= 300
+    # Tool metadata must be set
+    assert resp.json()["response_metadata"]["tool_used"] is True
 
 
 # ---------------------------------------------------------------------------
