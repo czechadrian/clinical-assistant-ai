@@ -57,7 +57,11 @@ _PATIENT_DISCLAIMER = DISCLAIMER_PATIENT
 
 
 def run_triage(classified: ClassifiedInput, rag_context: str = "") -> dict[str, Any]:
-    """TRIAGE: clarifying questions + red flags + conservative next steps.
+    """TRIAGE: clarifying questions + conservative next steps.
+
+    red_flags is intentionally empty here — main.py calls _enforce_redflag_policy()
+    after this returns, which populates red_flags and escalation steps when the
+    red-flag detector fires high severity.  Never populate red_flags here directly.
 
     flag="uncertain": triage by definition needs more clinical information.
     In Week 3 with a real LLM and high-confidence sources, flag becomes "safe".
@@ -68,10 +72,7 @@ def run_triage(classified: ClassifiedInput, rag_context: str = "") -> dict[str, 
             "Czy występują objawy alarmowe (ból w klatce piersiowej, duszność, utrata przytomności)?",
             "Jakie leki przyjmuje pacjent na stałe?",
         ],
-        "red_flags": [
-            "Ból w klatce piersiowej promieniujący do lewego ramienia lub szczęki — wykluczyć OZW.",
-            "Nagła duszność spoczynkowa — pilna ocena układu oddechowego i krążenia.",
-        ],
+        "red_flags": [],  # populated by _enforce_redflag_policy in main.py when severity=high
         "possible_next_steps": [
             "Zebranie pełnego wywiadu lekarskiego i badanie fizykalne.",
             "EKG 12-odprow. jeśli podejrzenie OZW.",

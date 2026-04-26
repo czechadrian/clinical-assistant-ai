@@ -87,9 +87,10 @@ def test_run_triage_flag_uncertain():
     assert d["flag"] == "uncertain"
 
 
-def test_run_triage_has_red_flags():
+def test_run_triage_red_flags_empty_by_default():
+    # red_flags is intentionally empty; _enforce_redflag_policy in main.py populates it.
     d = run_triage(_SAFE_CLASSIFIED)
-    assert len(d["red_flags"]) > 0
+    assert d["red_flags"] == []
 
 
 def test_run_triage_has_questions():
@@ -294,3 +295,125 @@ def test_invalid_mode_rejected_by_schema(client):
         resp = client.post("/chat", json={**_chat_body("triage"), "mode": "unknown_mode"})
 
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Day 24 — Red flag enforcement integration tests
+# ---------------------------------------------------------------------------
+
+
+_RED_FLAG_INPUT = "Pacjent z bólem w klatce piersiowej i nagłą duszością spoczynkową od 1 godziny."
+_SAFE_INPUT = "Pacjent skarży się na zmęczenie i bóle mięśniowe od tygodnia."
+
+
+def _chat_body_with_input(mode: str, input_text: str) -> dict:
+    return {"mode": mode, "input_text": input_text, "conversation_id": CONV_ID}
+
+
+def test_triage_redflag_populates_red_flags(client):
+    """High-severity triage input must produce non-empty red_flags in payload."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    assert resp.status_code == 200
+    payload = resp.json()["assistant_payload"]
+    assert len(payload["red_flags"]) > 0
+
+
+def test_triage_redflag_escalation_steps_prepended(client):
+    """Escalation steps must be the first items in possible_next_steps."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    steps = resp.json()["assistant_payload"]["possible_next_steps"]
+    assert steps, "possible_next_steps must not be empty for high-severity triage"
+    assert "112" in steps[0] or "SOR" in steps[0], "First step must reference emergency escalation"
+
+
+def test_triage_redflag_urgent_patient_summary(client):
+    """patient_facing_summary must contain urgent wording when severity=high."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    summary = resp.json()["assistant_payload"]["patient_facing_summary"]
+    assert "PILNE" in summary or "112" in summary
+
+
+def test_triage_redflag_metadata_persisted(client):
+    """redflag_severity and redflag_categories must be stored in assistant _meta."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)) as mock_insert,
+    ):
+        client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    assistant_content = mock_insert.call_args_list[1].args[1]["content"]
+    meta = assistant_content["_meta"]
+    assert meta["redflag_severity"] == "high"
+    assert isinstance(meta["redflag_categories"], list)
+    assert len(meta["redflag_categories"]) > 0
+
+
+def test_triage_redflag_metadata_in_response(client):
+    """redflag_severity must appear in response_metadata."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    meta = resp.json()["response_metadata"]
+    assert meta["redflag_severity"] == "high"
+    assert "chest_pain_dyspnea" in meta["redflag_categories"]
+
+
+def test_triage_no_redflag_for_safe_input(client):
+    """Non-urgent triage input must produce empty red_flags."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _SAFE_INPUT))
+
+    assert resp.status_code == 200
+    payload = resp.json()["assistant_payload"]
+    assert payload["red_flags"] == []
+    meta = resp.json()["response_metadata"]
+    assert meta["redflag_severity"] == "none"
+
+
+def test_redflag_not_triggered_for_summary_mode(client):
+    """Red flag detector must NOT run for summary mode — redflag_severity stays 'none'."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("summary", _RED_FLAG_INPUT))
+
+    assert resp.status_code == 200
+    meta = resp.json()["response_metadata"]
+    assert meta["redflag_severity"] == "none"
+
+
+def test_schema_valid_after_redflag_enforcement(client):
+    """AssistantPayload schema must be valid after red flag enforcement."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=_chat_body_with_input("triage", _RED_FLAG_INPUT))
+
+    assert resp.status_code == 200
+    payload = resp.json()["assistant_payload"]
+    for f in _REQUIRED_FIELDS:
+        assert f in payload, f"Missing schema field after enforcement: {f}"
+    assert payload["flag"] in ("safe", "uncertain", "refuse")

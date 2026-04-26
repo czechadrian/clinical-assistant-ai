@@ -108,15 +108,18 @@ function AssistantBubble({ content }: { content: unknown }) {
         </span>
       )}
 
-      {/* Red flags — shown first and highlighted */}
+      {/* Urgent escalation banner — shown when red flags present (code-enforced, not prompt-only) */}
       {payload.red_flags.length > 0 && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 dark:border-red-900/50 dark:bg-red-950/30">
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-red-600 dark:text-red-400">
-            Red flags
+        <div className="rounded-lg border-2 border-red-500 bg-red-100 px-3 py-2 dark:border-red-600 dark:bg-red-950/60">
+          <p className="mb-1 text-sm font-bold uppercase tracking-wide text-red-700 dark:text-red-400">
+            ⚠ Wysoki priorytet — pilna eskalacja
+          </p>
+          <p className="mb-2 text-xs text-red-700 dark:text-red-300">
+            Wykryto objawy wymagające natychmiastowej oceny. Proszę działać zgodnie z poniższymi wskazówkami.
           </p>
           <ul className="space-y-1">
             {payload.red_flags.map((f, i) => (
-              <li key={i} className="flex gap-2 text-xs text-red-700 dark:text-red-300">
+              <li key={i} className="flex gap-2 text-xs font-medium text-red-800 dark:text-red-200">
                 <span className="mt-0.5 shrink-0">▲</span>
                 {f}
               </li>

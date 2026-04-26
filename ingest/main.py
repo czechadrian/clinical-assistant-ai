@@ -22,6 +22,13 @@ from classifier import ClassifiedInput, classify_input  # noqa: F401
 from constants import DISCLAIMER_CLINICAL, SNIPPET_LEN
 from embedder import OpenAIEmbedder
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
+from redflag_detector import (
+    CATEGORY_LABELS,
+    ESCALATION_STEPS,
+    URGENT_PATIENT_SUMMARY,
+    RedFlagResult,
+    detect_red_flags,
+)
 from router import RouterDecision, route
 from settings import Settings, configure_logging
 from tools import guidelines_search
@@ -538,6 +545,9 @@ class ResponseMetadata(BaseModel):
     tool_used: bool = False
     tool_name: str | None = None
     retrieved_chunk_ids: list[str] = Field(default_factory=list)
+    # Red flag metadata (Day 24) — category labels only, no raw text
+    redflag_severity: str = "none"
+    redflag_categories: list[str] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -782,6 +792,27 @@ def _build_no_source_payload() -> AssistantPayload:
     )
 
 
+def _enforce_redflag_policy(raw_dict: dict[str, Any], redflag: RedFlagResult) -> None:
+    """Mutate *raw_dict* in-place to enforce stop-the-line escalation when severity=high.
+
+    Called only for triage workflow after _dispatch_workflow returns.
+    Must run before validate_and_repair so the enforced fields pass schema validation.
+
+    Rules:
+    - red_flags: replaced with human-readable category labels (no raw text).
+    - possible_next_steps: escalation steps prepended; original steps follow.
+    - patient_facing_summary: replaced with urgent wording.
+    - sources: untouched (main.py injects them separately).
+    - flag: kept as "uncertain" — triage always needs more info.
+    """
+    if not redflag.is_high:
+        return
+
+    raw_dict["red_flags"] = [CATEGORY_LABELS[c] for c in redflag.categories if c in CATEGORY_LABELS]
+    raw_dict["possible_next_steps"] = ESCALATION_STEPS + raw_dict.get("possible_next_steps", [])
+    raw_dict["patient_facing_summary"] = URGENT_PATIENT_SUMMARY
+
+
 def _check_groundedness(payload: AssistantPayload, high_confidence: list[dict]) -> AssistantPayload:
     """Downgrade to uncertain if sources[] is empty but the response contains
     specific guideline language (dosages, org-named guidelines, standard-of-care phrases).
@@ -869,6 +900,9 @@ class _PipelineResult:
     tool_name: str | None = None
     tool_query_hash: str | None = None
     retrieved_chunk_ids: list[str] = field(default_factory=list)
+    # Red flag metadata (Day 24) — labels only, no raw patient text.
+    redflag_severity: str = "none"
+    redflag_categories: list[str] = field(default_factory=list)
 
 
 async def _execute_chat_pipeline(
@@ -1072,7 +1106,24 @@ async def _execute_chat_pipeline(
             )
             tool_output = GuidelinesSearchOutput(items=[])
 
-    # 5. Build raw payload dict.
+    # 5. Red flag detection — triage only, before dispatch.
+    #    Runs on every triage request regardless of guardrail outcome so that
+    #    severity metadata is always available for audit.  Enforcement only fires
+    #    on the normal path (not unsafe, not vague).
+    redflag = detect_red_flags(body.input_text) if decision.workflow == "triage" else RedFlagResult(severity="none")
+    if redflag.is_high:
+        logger.warning(
+            "redflag_detected",
+            extra={
+                "request_id": request_id,
+                "redflag_severity": redflag.severity,
+                "redflag_categories": redflag.categories,
+                # explanation contains only category names — safe to log
+                "redflag_explanation": redflag.explanation,
+            },
+        )
+
+    # 5a. Build raw payload dict.
     if classified.is_unsafe_request:
         logger.warning("unsafe_request_refused", extra={"request_id": request_id})
         raw_dict = _build_refuse_payload().model_dump()
@@ -1081,6 +1132,8 @@ async def _execute_chat_pipeline(
         raw_dict = _build_uncertain_payload().model_dump()
     else:
         raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
+        # Stop-the-line: enforce escalation fields for high-severity triage.
+        _enforce_redflag_policy(raw_dict, redflag)
 
     # 4a. Inject sources — chunk_id + snippet, only from actual retrieval.
     if high_confidence and not classified.is_unsafe_request and not classified.is_vague:
@@ -1156,6 +1209,8 @@ async def _execute_chat_pipeline(
         if _tool_actually_used
         else None,
         retrieved_chunk_ids=_retrieved_ids,
+        redflag_severity=redflag.severity,
+        redflag_categories=redflag.categories,
     )
 
 
@@ -1298,6 +1353,8 @@ async def chat(
             "tool_name": result.tool_name,
             "tool_query_hash": result.tool_query_hash,
             "retrieved_chunk_ids": result.retrieved_chunk_ids,
+            "redflag_severity": result.redflag_severity,
+            "redflag_categories": result.redflag_categories,
         }
         if idempotency_key:
             assistant_meta["idempotency_key"] = idempotency_key
@@ -1328,6 +1385,8 @@ async def chat(
                 tool_used=result.tool_used,
                 tool_name=result.tool_name,
                 retrieved_chunk_ids=result.retrieved_chunk_ids,
+                redflag_severity=result.redflag_severity,
+                redflag_categories=result.redflag_categories,
             ),
         )
 
