@@ -26,6 +26,7 @@ export class ApiError extends Error {
     message: string,
     public readonly status: number,
     public readonly code?: string, // stable backend error code e.g. "PII_DETECTED"
+    public readonly extra?: Record<string, unknown>, // safe extra fields from error body
   ) {
     super(message);
     this.name = "ApiError";
@@ -118,12 +119,18 @@ export async function apiFetch<T = unknown>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    // New shape: {"error": {"code": "...", "message": "..."}}
+    // New shape: {"error": {"code": "...", "message": "...", ...extra}}
     // Legacy shape: {"detail": "..."}
-    const code: string | undefined = body?.error?.code;
-    const message: string =
-      body?.error?.message ?? body?.detail ?? `${res.status} ${res.statusText}`;
-    throw new ApiError(message, res.status, code);
+    const errorData: Record<string, unknown> = body?.error ?? {};
+    const code = errorData.code as string | undefined;
+    const message =
+      (errorData.message as string) ?? (body?.detail as string) ?? `${res.status} ${res.statusText}`;
+    // Collect extra fields (anything beyond the three standard fields)
+    const extra: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(errorData)) {
+      if (k !== "code" && k !== "message" && k !== "request_id") extra[k] = v;
+    }
+    throw new ApiError(message, res.status, code, Object.keys(extra).length > 0 ? extra : undefined);
   }
 
   return res.json() as Promise<T>;

@@ -29,6 +29,7 @@ from redflag_detector import (
     RedFlagResult,
     detect_red_flags,
 )
+from sanitizer import detect_and_sanitize
 from router import RouterDecision, route
 from settings import Settings, configure_logging
 from tools import guidelines_search
@@ -149,12 +150,18 @@ class AppError(Exception):
 
     Raised instead of HTTPException for domain errors in /chat.
     _app_error_handler converts it to a JSON response.
+
+    extra — optional safe data merged into the error response body, e.g.
+            {"pii_categories": ["email"], "sanitized_text": "..."} for
+            PII_DETECTED when pii_suggest_mode is enabled.  Never put raw
+            user content or secrets here.
     """
 
     code: str  # stable identifier e.g. "PII_DETECTED"
     message: str  # human-readable, safe to expose to the client
     http_status: int  # HTTP status code
     request_id: str | None = None  # set by the /chat handler
+    extra: dict = field(default_factory=dict)  # safe extra fields for error response
 
     def __post_init__(self) -> None:
         super().__init__(self.message)
@@ -162,15 +169,15 @@ class AppError(Exception):
 
 @app.exception_handler(AppError)
 async def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
+    error_body: dict = {
+        "code": exc.code,
+        "message": exc.message,
+        "request_id": exc.request_id,
+    }
+    error_body.update(exc.extra)  # safe: extra never contains raw user content
     return JSONResponse(
         status_code=exc.http_status,
-        content={
-            "error": {
-                "code": exc.code,
-                "message": exc.message,
-                "request_id": exc.request_id,
-            }
-        },
+        content={"error": error_body},
     )
 
 
@@ -928,12 +935,22 @@ async def _execute_chat_pipeline(
             "pii_rejected",
             extra={"request_id": request_id, "pii_type": classified.pii_flags[0]},
         )
+        extra: dict = {}
+        if settings.pii_suggest_mode:
+            san = detect_and_sanitize(body.input_text)
+            # pii_categories and sanitized_text are safe to surface to the caller;
+            # sanitized_text contains only placeholders — no raw patient text stored.
+            extra = {
+                "pii_categories": san.pii_flags,
+                "sanitized_text": san.sanitized_text,
+            }
         raise AppError(
             "PII_DETECTED",
             f"Potentially identifying patient data detected ({classified.pii_flags[0]}). "
             "Please remove personal identifiers before submitting.",
             status.HTTP_400_BAD_REQUEST,
             request_id,
+            extra,
         )
 
     # 0b. Injection detected — log and continue (non-blocking).
@@ -1032,6 +1049,7 @@ async def _execute_chat_pipeline(
     user_meta: dict[str, Any] = {
         "input_hash": classified.input_hash,
         "injection_flags": classified.injection_flags,
+        "pii_flags": classified.pii_flags,  # always [] here — PII aborts before this point
         "is_vague": classified.is_vague,
         "is_unsafe_request": classified.is_unsafe_request,
         "prompt_version": PROMPT_VERSION,

@@ -252,3 +252,218 @@ def test_check_groundedness_skips_refuse():
     )
     result = _check_groundedness(payload, high_confidence=[])
     assert result.flag == "refuse"
+
+
+# ---------------------------------------------------------------------------
+# Day 24 — Red flag stop-the-line integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_triage_redflag_enforces_escalation(client):
+    """High-severity triage input must have red_flags and escalation steps code-enforced."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post(
+            "/chat",
+            json={
+                **VALID_BODY,
+                "input_text": "Pacjent z bólem w klatce piersiowej i nagłą dusznością od 30 minut.",
+            },
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    payload = data["assistant_payload"]
+
+    # Code-enforced: red_flags must not be empty
+    assert len(payload["red_flags"]) > 0, "red_flags must be populated for high-severity triage"
+
+    # Escalation steps must be prepended (contain "112" or "SOR" — generic, not dosage-specific)
+    has_escalation = any(
+        "112" in step or "SOR" in step or "PILNE" in step
+        for step in payload["possible_next_steps"]
+    )
+    assert has_escalation, "escalation steps must appear in possible_next_steps"
+
+    # Urgent patient summary must be present
+    summary_lower = payload["patient_facing_summary"].lower()
+    assert "pilne" in summary_lower or "natychmiastow" in summary_lower, (
+        "patient_facing_summary must contain urgent wording"
+    )
+
+    # Schema integrity holds
+    assert payload["flag"] in ("safe", "uncertain", "refuse")
+    assert payload["disclaimer"]
+
+
+def test_triage_redflag_metadata(client):
+    """response_metadata.redflag_severity and redflag_categories must reflect detection."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post(
+            "/chat",
+            json={
+                **VALID_BODY,
+                "input_text": "Pacjent z bólem w klatce piersiowej i nagłą dusznością od 30 minut.",
+            },
+        )
+
+    assert resp.status_code == 200
+    metadata = resp.json()["response_metadata"]
+    assert metadata["redflag_severity"] == "high"
+    assert "chest_pain_dyspnea" in metadata["redflag_categories"]
+
+
+def test_triage_no_redflag_metadata(client):
+    """Clean triage input: redflag_severity='none', redflag_categories=[]."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post(
+            "/chat",
+            json={
+                **VALID_BODY,
+                "input_text": "Pacjent z łagodnym bólem głowy od dwóch dni, bez gorączki.",
+            },
+        )
+
+    assert resp.status_code == 200
+    metadata = resp.json()["response_metadata"]
+    assert metadata["redflag_severity"] == "none"
+    assert metadata["redflag_categories"] == []
+
+
+def test_summary_mode_redflag_not_run(client):
+    """summary mode: red flag detector does NOT run — redflag_severity must be 'none'."""
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post(
+            "/chat",
+            json={
+                **VALID_BODY,
+                "mode": "summary",
+                # Contains red-flag language but detector must NOT fire for summary
+                "input_text": "Pacjent z zawałem serca, leczony w OIT przez 5 dni, ACS potwierdzony.",
+            },
+        )
+
+    assert resp.status_code == 200
+    metadata = resp.json()["response_metadata"]
+    assert metadata["redflag_severity"] == "none"
+    assert metadata["redflag_categories"] == []
+    # red_flags field in payload must be empty (no enforcement without detector)
+    assert resp.json()["assistant_payload"]["red_flags"] == []
+
+
+# ---------------------------------------------------------------------------
+# Day 25 — De-identification / PII hardening integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_pii_block_does_not_insert_message(client):
+    """PII-blocked request must never call _db_insert (no message row created)."""
+    with patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)) as mock_insert:
+        resp = client.post(
+            "/chat",
+            json={**VALID_BODY, "input_text": "Contact patient at jan.kowalski@example.com"},
+        )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "PII_DETECTED"
+    mock_insert.assert_not_called()
+
+
+def test_pii_block_suggest_mode_off_no_extra(client):
+    """Default mode (pii_suggest_mode=False): error body has no sanitized_text."""
+    resp = client.post(
+        "/chat",
+        json={**VALID_BODY, "input_text": "E-mail: jan@example.com"},
+    )
+
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "PII_DETECTED"
+    assert "sanitized_text" not in error
+    assert "pii_categories" not in error
+
+
+def test_pii_block_suggest_mode_on_returns_suggestion(client, monkeypatch):
+    """With pii_suggest_mode=True, error body includes sanitized_text and pii_categories."""
+    import main as _main
+
+    monkeypatch.setattr(_main.settings, "pii_suggest_mode", True)
+
+    resp = client.post(
+        "/chat",
+        json={**VALID_BODY, "input_text": "Zadzwoń do pacjenta pod numer 604 123 456."},
+    )
+
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["code"] == "PII_DETECTED"
+    assert "pii_categories" in error
+    assert "phone" in error["pii_categories"]
+    assert "sanitized_text" in error
+    assert "[PHONE]" in error["sanitized_text"]
+    # Raw phone number must NOT appear in the suggestion
+    assert "604 123 456" not in error["sanitized_text"]
+
+
+def test_pii_block_suggest_mode_email_and_phone(client, monkeypatch):
+    """Suggest mode: both email and phone categories reported when both are present."""
+    import main as _main
+
+    monkeypatch.setattr(_main.settings, "pii_suggest_mode", True)
+
+    resp = client.post(
+        "/chat",
+        json={
+            **VALID_BODY,
+            "input_text": "tel. 604123456 lub e-mail jan@klinika.pl",
+        },
+    )
+
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert "phone" in error["pii_categories"]
+    assert "email" in error["pii_categories"]
+    assert "[PHONE]" in error["sanitized_text"]
+    assert "[EMAIL]" in error["sanitized_text"]
+
+
+def test_passing_message_stores_pii_flags_in_meta(client):
+    """Messages that pass the PII check store pii_flags=[] explicitly in _meta."""
+    captured_calls: list[dict] = []
+
+    async def capturing_insert(table: str, row: dict, jwt: str) -> dict:
+        captured_calls.append({"table": table, "row": row})
+        return _MSG_ROW
+
+    with (
+        patch("main._db_select", new=AsyncMock(return_value=_CONV_ROW)),
+        patch("main._db_insert", new=AsyncMock(side_effect=capturing_insert)),
+    ):
+        resp = client.post(
+            "/chat",
+            json={
+                **VALID_BODY,
+                "input_text": "Pacjent z łagodnym bólem głowy od dwóch dni.",
+            },
+        )
+
+    assert resp.status_code == 200
+
+    # Find the user message insert
+    user_inserts = [c for c in captured_calls if c["table"] == "messages" and c["row"]["role"] == "user"]
+    assert len(user_inserts) == 1
+
+    meta = user_inserts[0]["row"]["content"]["_meta"]
+    assert "pii_flags" in meta
+    assert meta["pii_flags"] == []  # always empty — PII aborts before this point

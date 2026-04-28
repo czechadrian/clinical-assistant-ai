@@ -21,12 +21,27 @@ function getUserText(content: unknown): string {
 // Falls back to the raw error message for unknown codes.
 const ERROR_MESSAGES: Record<string, string> = {
   PII_DETECTED:
-    "Wykryto dane identyfikacyjne pacjenta (np. e-mail, PESEL, telefon). Usuń je przed wysłaniem.",
+    "Wykryto dane identyfikacyjne pacjenta. Usuń identyfikatory przed wysłaniem.",
   MOCK_DISABLED: "Integracja z modelem AI nie jest jeszcze włączona. Skontaktuj się z administratorem.",
   CONVERSATION_NOT_FOUND: "Nie znaleziono rozmowy. Odśwież stronę i spróbuj ponownie.",
   VALIDATION_FAILED: "Odpowiedź asystenta nie spełnia wymagań schematu. Spróbuj ponownie.",
   TIMEOUT: "Przekroczono czas oczekiwania na odpowiedź. Spróbuj ponownie.",
   TRANSIENT_UPSTREAM: "Usługa chwilowo niedostępna. Spróbuj ponownie za chwilę.",
+};
+
+// Human-readable Polish labels for PII category names returned by the backend.
+const PII_CATEGORY_LABELS: Record<string, string> = {
+  email: "adres e-mail",
+  phone: "numer telefonu",
+  pesel: "PESEL",
+  nip: "NIP",
+  date_of_birth: "data urodzenia",
+  address: "adres zamieszkania",
+};
+
+type PiiSuggestion = {
+  categories: string[];
+  sanitizedText?: string;
 };
 
 function getErrorMessage(err: unknown): string {
@@ -262,6 +277,7 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   const [mode, setMode] = useState<ChatMode>("triage");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [piiSuggestion, setPiiSuggestion] = useState<PiiSuggestion | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -269,6 +285,7 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   // Also clear stale UI state so errors/title from a previous panel don't bleed over.
   useEffect(() => {
     setError(null);
+    setPiiSuggestion(null);
     setNewTitle("");
 
     if (!conversationId) {
@@ -302,6 +319,7 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
 
     setSending(true);
     setError(null);
+    setPiiSuggestion(null);
     setInput("");
 
     // One idempotency key per send attempt — ensures exactly-once delivery even
@@ -351,6 +369,15 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUser.id));
       setError(getErrorMessage(err));
       setInput(text);
+      // Extract PII suggestion from backend (only present when pii_suggest_mode is enabled).
+      if (err instanceof ApiError && err.code === "PII_DETECTED" && err.extra) {
+        const cats = err.extra.pii_categories;
+        const san = err.extra.sanitized_text;
+        setPiiSuggestion({
+          categories: Array.isArray(cats) ? (cats as string[]) : [],
+          sanitizedText: typeof san === "string" ? san : undefined,
+        });
+      }
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -417,7 +444,43 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
           <span>Do not paste identifying patient data (name, PESEL, phone, e-mail).</span>
         </div>
 
-        {error && <p className="mb-2 text-xs text-red-500">{error}</p>}
+        {error && (
+          <div className="mb-2">
+            <p className="text-xs text-red-500">{error}</p>
+            {piiSuggestion && piiSuggestion.categories.length > 0 && (
+              <div className="mt-1.5 rounded-md border border-red-200 bg-red-50 p-2 text-xs dark:border-red-800 dark:bg-red-950/30">
+                <p className="font-medium text-red-700 dark:text-red-400">
+                  Wykryte typy danych:{" "}
+                  {piiSuggestion.categories
+                    .map((c) => PII_CATEGORY_LABELS[c] ?? c)
+                    .join(", ")}
+                </p>
+                <p className="mt-0.5 text-red-600 dark:text-red-400">
+                  Usuń lub zastąp identyfikatory, a następnie wyślij ponownie.
+                </p>
+                {piiSuggestion.sanitizedText && (
+                  <details className="mt-1.5">
+                    <summary className="cursor-pointer select-none font-medium text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300">
+                      Podgląd po usunięciu identyfikatorów
+                    </summary>
+                    <div className="mt-1 flex items-start gap-2">
+                      <pre className="flex-1 whitespace-pre-wrap rounded border border-red-200 bg-white px-2 py-1.5 font-mono text-red-800 dark:border-red-800 dark:bg-zinc-900 dark:text-red-300">
+                        {piiSuggestion.sanitizedText}
+                      </pre>
+                      <button
+                        type="button"
+                        onClick={() => setInput(piiSuggestion.sanitizedText!)}
+                        className="shrink-0 rounded border border-red-300 px-2 py-1 text-xs text-red-600 transition hover:border-red-500 hover:bg-red-100 dark:border-red-700 dark:text-red-400 dark:hover:bg-red-950/60"
+                      >
+                        Użyj
+                      </button>
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Mode selector */}
         <div className="mb-2 flex gap-1">

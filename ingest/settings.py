@@ -121,6 +121,10 @@ class Settings:
     # OPTIONAL — validation_debug: if True, the HTTP 500 body includes the invalid
     # field paths (never values).  Set only in local dev; must stay False in prod.
     validation_debug: bool
+    # OPTIONAL — pii_suggest_mode: if True, the PII_DETECTED 400 error body includes
+    # sanitized_text (placeholders only) and pii_categories so the UI can display a
+    # preview.  The sanitized text is NEVER stored — display and resubmit only.
+    pii_suggest_mode: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -150,4 +154,5 @@ class Settings:
             git_commit=_get_git_commit(),
             chat_mock_mode=os.getenv("CHAT_MOCK_MODE", "true").lower() == "true",
             validation_debug=os.getenv("VALIDATION_DEBUG", "false").lower() == "true",
+            pii_suggest_mode=os.getenv("PII_SUGGEST_MODE", "false").lower() == "true",
         )
