@@ -221,3 +221,56 @@ create trigger trg_messages_touch_conversation
   after insert on public.messages
   for each row
   execute function public.fn_touch_conversation();
+
+
+-- ============================================================
+-- F. conversation_state  (Migration 002)
+--    One sanitized-summary row per conversation.
+--    No patient identifiers; built from assistant-generated
+--    fields only.  See supabase/migrations/002_conversation_state.sql
+-- ============================================================
+
+create table if not exists public.conversation_state (
+  conversation_id   uuid        primary key
+                    references  public.conversations(id) on delete cascade,
+  user_id           uuid        not null
+                    references  auth.users(id) on delete cascade,
+  summary           text        not null default '',
+  open_questions    jsonb       not null default '[]'::jsonb,
+  known_constraints jsonb       not null default '[]'::jsonb,
+  updated_at        timestamptz not null default now()
+);
+
+alter table public.conversation_state enable row level security;
+
+drop policy if exists "conversation_state: select own"  on public.conversation_state;
+drop policy if exists "conversation_state: insert own"  on public.conversation_state;
+drop policy if exists "conversation_state: update own"  on public.conversation_state;
+drop policy if exists "conversation_state: delete own"  on public.conversation_state;
+
+create policy "conversation_state: select own"
+  on public.conversation_state for select
+  using (auth.uid() = user_id);
+
+create policy "conversation_state: insert own"
+  on public.conversation_state for insert
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.conversations c
+      where  c.id      = conversation_id
+        and  c.user_id = auth.uid()
+    )
+  );
+
+create policy "conversation_state: update own"
+  on public.conversation_state for update
+  using     (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+create policy "conversation_state: delete own"
+  on public.conversation_state for delete
+  using (auth.uid() = user_id);
+
+create index if not exists idx_conversation_state_user_id
+  on public.conversation_state (user_id);

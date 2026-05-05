@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ApiError, createConversation, getMessages, postChat, withRetry, type AssistantPayload, type ChatMode } from "@/lib/api";
+import { ApiError, createConversation, getConversationState, getMessages, postChat, withRetry, type AssistantPayload, type ChatMode, type ConversationStateOut } from "@/lib/api";
 
 type Message = {
   id: string;
@@ -278,6 +278,8 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [piiSuggestion, setPiiSuggestion] = useState<PiiSuggestion | null>(null);
+  const [conversationState, setConversationState] = useState<ConversationStateOut | null>(null);
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -286,6 +288,8 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
   useEffect(() => {
     setError(null);
     setPiiSuggestion(null);
+    setConversationState(null);
+    setShowMemoryPanel(false);
     setNewTitle("");
 
     if (!conversationId) {
@@ -302,6 +306,14 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
       if (cancelled) return;
       setError(err instanceof Error ? err.message : "Failed to load messages");
     });
+
+    // Load conversation memory (dev-only feature — no-op in production).
+    if (IS_DEV) {
+      getConversationState(conversationId).then((state) => {
+        if (cancelled) return;
+        setConversationState(state);
+      }).catch(() => { /* memory is non-critical — silent failure */ });
+    }
 
     return () => {
       cancelled = true;
@@ -364,6 +376,13 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
       // conversationId prop change triggers useEffect which re-fetches
       // from DB (already populated) without a visible flash.
       if (createdId) onConversationCreated(createdId);
+
+      // Refresh memory panel (dev only) after each assistant response.
+      if (IS_DEV && convId) {
+        getConversationState(convId).then((state) => {
+          setConversationState(state);
+        }).catch(() => { /* non-critical */ });
+      }
     } catch (err) {
       // Roll back the optimistic message and restore the draft.
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUser.id));
@@ -435,6 +454,50 @@ export function MessagePanel({ conversationId, onConversationCreated }: Props) {
           </div>
         )}
       </div>
+
+      {/* Conversation context panel — dev/admin only */}
+      {IS_DEV && conversationState && conversationState.summary && (
+        <div className="border-t border-zinc-200 bg-zinc-50 px-4 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/50">
+          <button
+            type="button"
+            onClick={() => setShowMemoryPanel((v) => !v)}
+            className="flex w-full items-center gap-1.5 text-left text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+          >
+            <span className="font-mono text-zinc-400 dark:text-zinc-600">{showMemoryPanel ? "▾" : "▸"}</span>
+            <span className="font-medium">Conversation context</span>
+            <span className="ml-auto font-mono text-zinc-400">{conversationState.summary.length}c</span>
+          </button>
+          {showMemoryPanel && (
+            <div className="mt-2 space-y-2 rounded-md border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900">
+              <div>
+                <p className="mb-0.5 font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">Summary</p>
+                <p className="font-mono text-zinc-600 dark:text-zinc-300">{conversationState.summary}</p>
+              </div>
+              {conversationState.open_questions.length > 0 && (
+                <div>
+                  <p className="mb-0.5 font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">Open questions</p>
+                  <ul className="space-y-0.5">
+                    {conversationState.open_questions.map((q, i) => (
+                      <li key={i} className="text-zinc-600 dark:text-zinc-300">? {q}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {conversationState.known_constraints.length > 0 && (
+                <div>
+                  <p className="mb-0.5 font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">Known constraints</p>
+                  <ul className="space-y-0.5">
+                    {conversationState.known_constraints.map((c, i) => (
+                      <li key={i} className="text-zinc-600 dark:text-zinc-300">▲ {c}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <p className="text-right text-zinc-400 dark:text-zinc-600">Updated {conversationState.updated_at.slice(0, 19).replace("T", " ")} UTC</p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Input bar — always visible; sending with no conversation creates one */}
       <div className="border-t border-zinc-200 bg-white px-4 pb-4 pt-3 dark:border-zinc-800 dark:bg-zinc-950">

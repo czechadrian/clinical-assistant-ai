@@ -295,3 +295,18 @@ export async function postChat(
     }),
   });
 }
+
+export type ConversationStateOut = {
+  summary: string;
+  open_questions: string[];
+  known_constraints: string[];
+  updated_at: string;
+};
+
+export async function getConversationState(
+  conversationId: string,
+): Promise<ConversationStateOut | null> {
+  return apiFetch<ConversationStateOut | null>(
+    `/conversations/${conversationId}/state`,
+  );
+}

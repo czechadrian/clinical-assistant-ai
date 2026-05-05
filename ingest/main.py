@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from classifier import ClassifiedInput, classify_input  # noqa: F401
 from constants import DISCLAIMER_CLINICAL, SNIPPET_LEN
 from embedder import OpenAIEmbedder
+from memory import ConversationState, build_memory
 from policy import PROMPT_VERSION, SYSTEM_PROMPT  # noqa: F401  (used in future Claude integration)
 from redflag_detector import (
     CATEGORY_LABELS,
@@ -29,8 +30,8 @@ from redflag_detector import (
     RedFlagResult,
     detect_red_flags,
 )
-from sanitizer import detect_and_sanitize
 from router import RouterDecision, route
+from sanitizer import detect_and_sanitize
 from settings import Settings, configure_logging
 from tools import guidelines_search
 from tools.guidelines_search import GuidelinesSearchInput, GuidelinesSearchOutput
@@ -328,6 +329,42 @@ async def _db_insert(table: str, row: dict, jwt: str) -> dict:
     return response.json()[0]
 
 
+async def _db_upsert(table: str, row: dict, jwt: str) -> dict:
+    """Insert or update one row using PostgREST merge-duplicates resolution.
+
+    The unique/primary key column(s) in *row* determine the conflict target.
+    RLS applies via the caller's JWT — never call this with the service role key
+    for user-owned tables.
+    """
+    response = await _retrying_request(
+        lambda: _db_client.post(
+            f"/{table}",
+            json=row,
+            headers={
+                **_rls_headers(jwt),
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+    )
+    if response.status_code in (401, 403):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Permission denied: {table}")
+    if response.status_code not in (200, 201):
+        logger.error(
+            "db_upsert_failed",
+            extra={
+                "table": table,
+                "http_status": response.status_code,
+                "postgrest_error": response.text,
+            },
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"DB upsert failed: {table} (HTTP {response.status_code}) — check server logs",
+        )
+    rows = response.json()
+    return rows[0] if isinstance(rows, list) and rows else {}
+
+
 async def _db_select(path: str, params: dict, jwt: str) -> list[dict]:
     """Run a GET query against PostgREST. RLS applies via the caller's JWT."""
     response = await _retrying_request(
@@ -563,6 +600,19 @@ class ChatResponse(BaseModel):
     response_metadata: ResponseMetadata
 
 
+class ConversationStateOut(BaseModel):
+    """Sanitized clinical-context summary for a conversation.
+
+    Returned by GET /conversations/{id}/state and injected into the chat
+    pipeline as prior context.  Never contains patient identifiers.
+    """
+
+    summary: str
+    open_questions: list[str]
+    known_constraints: list[str]
+    updated_at: str
+
+
 class DocOut(BaseModel):
     id: str
     title: str
@@ -710,6 +760,97 @@ def _has_guideline_language(text: str) -> bool:
     Used only to check assistant-generated output, never raw user input.
     """
     return bool(_GUIDELINE_LANGUAGE_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Conversation memory helpers
+#
+# _format_memory_context — wraps a ConversationState in XML-like tags so the
+#   LLM treats it as prior context, not new instructions.  Same isolation
+#   pattern used for RAG context.  Never logged — may contain clinical summary.
+#
+# _update_conversation_state_bg — background task that fetches the last N
+#   messages after a successful /chat turn, rebuilds the state via build_memory,
+#   and upserts into conversation_state.  Runs after the HTTP response is sent
+#   so it never adds latency.  Failures are logged but not raised (non-critical
+#   path — continuity degrades gracefully to the previous state).
+# ---------------------------------------------------------------------------
+
+
+def _format_memory_context(state: ConversationStateOut | None) -> str:
+    """Return a structured memory block for injection into workflow context.
+
+    Returns "" when there is no prior state or the summary is empty, so callers
+    can concatenate without branching.
+    """
+    if not state or not state.summary:
+        return ""
+    parts = ["<conversation_memory>", f"<context_summary>{state.summary}</context_summary>"]
+    if state.open_questions:
+        items = "\n".join(f"- {q}" for q in state.open_questions)
+        parts.append(f"<open_questions>\n{items}\n</open_questions>")
+    if state.known_constraints:
+        items = "\n".join(f"- {c}" for c in state.known_constraints)
+        parts.append(f"<known_constraints>\n{items}\n</known_constraints>")
+    parts.append("</conversation_memory>")
+    return "\n".join(parts)
+
+
+async def _update_conversation_state_bg(conversation_id: str, user_id: str, jwt: str) -> None:
+    """Fetch last messages, rebuild memory, upsert conversation_state.
+
+    Intended to run as a FastAPI BackgroundTask — never blocks the HTTP response.
+    Failures are logged and swallowed; a missing state causes the next request to
+    run without prior context (safe degradation).
+    """
+    try:
+        rows = await _db_select(
+            "/messages",
+            {
+                "conversation_id": f"eq.{conversation_id}",
+                "order": "created_at.desc",
+                "limit": "10",
+                "select": "role,content",
+            },
+            jwt,
+        )
+        # Rows are newest-first; reverse to chronological for build_memory.
+        state: ConversationState = build_memory(list(reversed(rows)))
+
+        # Skip upsert if there is nothing meaningful to store yet.
+        if not state.summary and not state.open_questions and not state.known_constraints:
+            return
+
+        await _db_upsert(
+            "conversation_state",
+            {
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "summary": state.summary,
+                "open_questions": state.open_questions,
+                "known_constraints": state.known_constraints,
+                "updated_at": state.updated_at,
+            },
+            jwt,
+        )
+        logger.info(
+            "memory_updated",
+            extra={
+                "conversation_id": conversation_id,
+                # Counts only — never log summary text (contains clinical context)
+                "summary_len": len(state.summary),
+                "open_questions_count": len(state.open_questions),
+                "known_constraints_count": len(state.known_constraints),
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "memory_update_failed",
+            extra={
+                "conversation_id": conversation_id,
+                "reason": type(exc).__name__,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1051,8 @@ class _PipelineResult:
     # Red flag metadata (Day 24) — labels only, no raw patient text.
     redflag_severity: str = "none"
     redflag_categories: list[str] = field(default_factory=list)
+    # Memory (Day 26) — True when prior conversation_state was found and injected.
+    memory_loaded: bool = False
 
 
 async def _execute_chat_pipeline(
@@ -986,7 +1129,47 @@ async def _execute_chat_pipeline(
             request_id,
         )
 
-    # 1a. Idempotency check — before any writes.
+    # 1a. Load conversation state for memory continuity.
+    #
+    # Runs after ownership is confirmed (step 1) so we only query state rows
+    # that belong to this user.  Failures degrade gracefully to no-memory mode —
+    # the assistant response is still valid; continuity is just lost for that turn.
+    _memory_context = ""
+    _memory_loaded = False
+    try:
+        state_rows = await _db_select(
+            "/conversation_state",
+            {
+                "conversation_id": f"eq.{body.conversation_id}",
+                "select": "summary,open_questions,known_constraints,updated_at",
+            },
+            auth.jwt,
+        )
+        if state_rows and state_rows[0].get("summary"):
+            r = state_rows[0]
+            _prior_state = ConversationStateOut(
+                summary=r["summary"],
+                open_questions=r.get("open_questions") or [],
+                known_constraints=r.get("known_constraints") or [],
+                updated_at=r.get("updated_at", ""),
+            )
+            _memory_context = _format_memory_context(_prior_state)
+            _memory_loaded = True
+            logger.info(
+                "memory_loaded",
+                extra={
+                    "request_id": request_id,
+                    "conversation_id": body.conversation_id,
+                    "summary_len": len(r["summary"]),
+                },
+            )
+    except Exception as exc:
+        logger.warning(
+            "memory_load_failed",
+            extra={"request_id": request_id, "reason": type(exc).__name__},
+        )
+
+    # 1b. Idempotency check — before any writes.
     if idempotency_key:
         cached_rows = await _db_select(
             "/messages",
@@ -1128,7 +1311,11 @@ async def _execute_chat_pipeline(
     #    Runs on every triage request regardless of guardrail outcome so that
     #    severity metadata is always available for audit.  Enforcement only fires
     #    on the normal path (not unsafe, not vague).
-    redflag = detect_red_flags(body.input_text) if decision.workflow == "triage" else RedFlagResult(severity="none")
+    redflag = (
+        detect_red_flags(body.input_text)
+        if decision.workflow == "triage"
+        else RedFlagResult(severity="none")
+    )
     if redflag.is_high:
         logger.warning(
             "redflag_detected",
@@ -1149,7 +1336,12 @@ async def _execute_chat_pipeline(
         logger.info("vague_input_uncertain", extra={"request_id": request_id})
         raw_dict = _build_uncertain_payload().model_dump()
     else:
-        raw_dict = _dispatch_workflow(decision.workflow, classified, rag_context)
+        # Prepend memory context before RAG context so the LLM sees prior state
+        # as background, not as the primary instruction source.
+        full_context = (
+            (_memory_context + "\n" + rag_context).strip() if _memory_context else rag_context
+        )
+        raw_dict = _dispatch_workflow(decision.workflow, classified, full_context)
         # Stop-the-line: enforce escalation fields for high-severity triage.
         _enforce_redflag_policy(raw_dict, redflag)
 
@@ -1229,6 +1421,7 @@ async def _execute_chat_pipeline(
         retrieved_chunk_ids=_retrieved_ids,
         redflag_severity=redflag.severity,
         redflag_categories=redflag.categories,
+        memory_loaded=_memory_loaded,
     )
 
 
@@ -1312,6 +1505,7 @@ async def get_messages(
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     body: ChatRequest,
+    background_tasks: BackgroundTasks,
     auth: Auth = Depends(get_auth),  # noqa: B008
     idempotency_key: str | None = Header(None, alias="idempotency-key"),  # noqa: B008
 ):
@@ -1391,6 +1585,15 @@ async def chat(
             auth.jwt,
         )
 
+        # Schedule memory update after the response is sent — non-blocking.
+        # Runs only on the normal path (not idempotency replays, which don't add new messages).
+        background_tasks.add_task(
+            _update_conversation_state_bg,
+            body.conversation_id,
+            user_id,
+            auth.jwt,
+        )
+
         return ChatResponse(
             request_id=request_id,
             assistant_payload=payload,
@@ -1448,6 +1651,7 @@ async def chat(
 @app.post("/chat/stream")
 async def chat_stream(
     body: ChatRequest,
+    background_tasks: BackgroundTasks,
     auth: Auth = Depends(get_auth),  # noqa: B008
     idempotency_key: str | None = Header(None, alias="idempotency-key"),  # noqa: B008
 ) -> StreamingResponse:
@@ -1504,10 +1708,61 @@ async def chat_stream(
         auth.jwt,
     )
 
+    # Schedule memory update after the stream closes — non-blocking.
+    background_tasks.add_task(
+        _update_conversation_state_bg,
+        body.conversation_id,
+        user_id,
+        auth.jwt,
+    )
+
     return StreamingResponse(
         _mock_sse_stream(payload, request_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversation state endpoint (Day 26 — conversation memory)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/conversations/{conversation_id}/state", response_model=ConversationStateOut | None)
+async def get_conversation_state(
+    conversation_id: str,
+    auth: Auth = Depends(get_auth),  # noqa: B008
+) -> ConversationStateOut | None:
+    """Return the sanitized memory summary for a conversation, or null if none exists.
+
+    RLS enforces ownership — PostgREST returns [] for conversations owned by
+    other users, which we surface as a 404 rather than leaking existence.
+    """
+    conv_rows = await _db_select(
+        "/conversations",
+        {"id": f"eq.{conversation_id}", "user_id": f"eq.{auth.user_id}", "select": "id"},
+        auth.jwt,
+    )
+    if not conv_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+    rows = await _db_select(
+        "/conversation_state",
+        {
+            "conversation_id": f"eq.{conversation_id}",
+            "select": "summary,open_questions,known_constraints,updated_at",
+        },
+        auth.jwt,
+    )
+    if not rows:
+        return None
+
+    r = rows[0]
+    return ConversationStateOut(
+        summary=r.get("summary", ""),
+        open_questions=r.get("open_questions") or [],
+        known_constraints=r.get("known_constraints") or [],
+        updated_at=r.get("updated_at", ""),
     )
 
 

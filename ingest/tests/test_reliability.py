@@ -117,7 +117,8 @@ def test_chat_idempotency_returns_cached_response(client):
             new=AsyncMock(
                 side_effect=[
                     _CONV_ROW,  # call 1: conversation ownership check
-                    _CACHED_MSG,  # call 2: idempotency check → hit
+                    [],          # call 2: conversation_state load → no prior state
+                    _CACHED_MSG,  # call 3: idempotency check → hit
                 ]
             ),
         ),
@@ -148,7 +149,8 @@ def test_chat_new_request_stores_idempotency_key(client):
             new=AsyncMock(
                 side_effect=[
                     _CONV_ROW,  # call 1: conversation ownership check
-                    [],  # call 2: idempotency check → miss (new request)
+                    [],         # call 2: conversation_state load → no prior state
+                    [],         # call 3: idempotency check → miss (new request)
                 ]
             ),
         ),

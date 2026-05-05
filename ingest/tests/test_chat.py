@@ -282,8 +282,7 @@ def test_triage_redflag_enforces_escalation(client):
 
     # Escalation steps must be prepended (contain "112" or "SOR" — generic, not dosage-specific)
     has_escalation = any(
-        "112" in step or "SOR" in step or "PILNE" in step
-        for step in payload["possible_next_steps"]
+        "112" in step or "SOR" in step or "PILNE" in step for step in payload["possible_next_steps"]
     )
     assert has_escalation, "escalation steps must appear in possible_next_steps"
 
@@ -461,9 +460,105 @@ def test_passing_message_stores_pii_flags_in_meta(client):
     assert resp.status_code == 200
 
     # Find the user message insert
-    user_inserts = [c for c in captured_calls if c["table"] == "messages" and c["row"]["role"] == "user"]
+    user_inserts = [
+        c for c in captured_calls if c["table"] == "messages" and c["row"]["role"] == "user"
+    ]
     assert len(user_inserts) == 1
 
     meta = user_inserts[0]["row"]["content"]["_meta"]
     assert "pii_flags" in meta
     assert meta["pii_flags"] == []  # always empty — PII aborts before this point
+
+
+# ---------------------------------------------------------------------------
+# Day 26 — Conversation memory integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_chat_no_prior_state_proceeds_normally(client):
+    """No conversation_state row → pipeline runs normally with memory_loaded=False."""
+
+    async def _select(path, params, jwt):
+        if "conversation_state" in path:
+            return []
+        return _CONV_ROW
+
+    with (
+        patch("main._db_select", new=AsyncMock(side_effect=_select)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=VALID_BODY)
+
+    assert resp.status_code == 200
+    assert resp.json()["assistant_payload"]["flag"] in ("safe", "uncertain", "refuse")
+
+
+def test_chat_with_prior_state_proceeds_normally(client):
+    """Existing conversation_state is loaded; pipeline returns a valid response."""
+    state_row = {
+        "summary": "[triage] flag:uncertain Wykonaj EKG",
+        "open_questions": ["Od kiedy ból?"],
+        "known_constraints": [],
+        "updated_at": "2026-05-05T08:00:00+00:00",
+    }
+
+    async def _select(path, params, jwt):
+        if "conversation_state" in path:
+            return [state_row]
+        return _CONV_ROW
+
+    with (
+        patch("main._db_select", new=AsyncMock(side_effect=_select)),
+        patch("main._db_insert", new=AsyncMock(return_value=_MSG_ROW)),
+    ):
+        resp = client.post("/chat", json=VALID_BODY)
+
+    assert resp.status_code == 200
+    assert resp.json()["assistant_payload"]["flag"] in ("safe", "uncertain", "refuse")
+
+
+def test_conversation_state_endpoint_not_found(client):
+    """GET /conversations/{id}/state → 404 when conversation does not belong to user."""
+    with patch("main._db_select", new=AsyncMock(return_value=[])):
+        resp = client.get(f"/conversations/{VALID_BODY['conversation_id']}/state")
+    assert resp.status_code == 404
+
+
+def test_conversation_state_endpoint_null_when_no_state(client):
+    """GET /conversations/{id}/state → 200 null when no state row exists yet."""
+
+    async def _select(path, params, jwt):
+        if "conversation_state" in path:
+            return []
+        return _CONV_ROW
+
+    with patch("main._db_select", new=AsyncMock(side_effect=_select)):
+        resp = client.get(f"/conversations/{VALID_BODY['conversation_id']}/state")
+
+    assert resp.status_code == 200
+    assert resp.json() is None
+
+
+def test_conversation_state_endpoint_returns_state(client):
+    """GET /conversations/{id}/state returns the stored state when it exists."""
+    state_row = {
+        "summary": "[triage] flag:uncertain Wykonaj EKG natychmiast",
+        "open_questions": ["Od jak dawna ból?"],
+        "known_constraints": ["Ból w klatce piersiowej"],
+        "updated_at": "2026-05-05T10:00:00+00:00",
+    }
+
+    async def _select(path, params, jwt):
+        if "conversation_state" in path:
+            return [state_row]
+        return _CONV_ROW
+
+    with patch("main._db_select", new=AsyncMock(side_effect=_select)):
+        resp = client.get(f"/conversations/{VALID_BODY['conversation_id']}/state")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["summary"] == state_row["summary"]
+    assert data["open_questions"] == ["Od jak dawna ból?"]
+    assert data["known_constraints"] == ["Ból w klatce piersiowej"]
+    assert data["updated_at"] == state_row["updated_at"]
